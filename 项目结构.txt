@@ -1,0 +1,48 @@
+SAMba-Crack-Detection/mmsegmentation/
+├── configs/
+│   ├── _base_/
+│   │   ├── datasets/
+│   │   │   └── crack_datasets.py  <-- (新建) 1. 在这里定义你的数据集信息
+│   │   │       (路径: mmsegmentation/configs/_base_/datasets/crack_datasets.py)
+│   │   ├── models/
+│   │   └── schedules/
+│   │
+│   └── samba_unet/
+│       └── samba-unet_hiera-vmamba_512x512_80k_crack500.py  <-- (新建) 2. 在这里写你的模型“组装图纸”
+│           (路径: mmsegmentation/configs/samba_unet/samba-unet_hiera-vmamba_512x512_80k_crack500.py)
+│
+├── data/
+│   ├── crack500/                 <-- 3. Crack500数据集放这里 (需要你手动创建)
+│   │   ├── img_dir/
+│   │   │   ├── train/
+│   │   │   └── val/
+│   │   └── ann_dir/
+│   │       ├── train/
+│   │       └── val/
+│   ├── deepcrack/                <-- DeepCrack数据集放这里 (需要你手动创建)
+│   │   └── ...
+│
+├── mmseg_custom/                  <-- (新建) 4. 这是你的核心创新代码区！
+│   │                               (路径: mmsegmentation/mmseg_custom/)
+│   ├── __init__.py
+│   ├── models/
+│   │   ├── __init__.py
+│   │   ├── backbones/
+│   │   │   ├── __init__.py
+│   │   │   ├── hiera.py           <-- (新建) SAM2 Hiera骨干网络代码 (路径: .../backbones/hiera.py)
+│   │   │   ├── vmamba.py          <-- (新建) Mamba骨干网络代码 (路径: .../backbones/vmamba.py)
+│   │   │   └── samba_dual_encoder.py <-- (新建) 组合上面两个的双编码器 (路径: .../backbones/samba_dual_encoder.py)
+│   │   ├── necks/
+│   │   │   ├── __init__.py
+│   │   │   └── hoacm.py           <-- (新建) HOACM融合模块代码 (路径: .../necks/hoacm.py)
+│   │   └── decode_heads/
+│   │       ├── __init__.py
+│   │       └── samba_head.py      <-- (新建) 你的解码器头代码 (路径: .../decode_heads/samba_head.py)
+│
+├── tools/
+│   └── train.py                   <-- 使用MMSegmentation官方的训练脚本
+│
+├── work_dirs/                     <-- 5. 训练日志、模型权重等会自动保存在这里
+│   └── ...
+│
+└── requirements.txt
