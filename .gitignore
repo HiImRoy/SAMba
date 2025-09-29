@@ -17,3 +17,4 @@ checkpoint_TUT/*
 !checkpoint_TUT/.gitkeep
 /data/
 /results/
+/sam2_checkpoints/

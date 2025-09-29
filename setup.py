@@ -1,11 +1,11 @@
 import setuptools
 
 setuptools.setup(
-    name="SCSegamba",
+    name="SAMba",
     version="0.25.0",
     author="Your Name",
     author_email="your.email@example.com",
-    description="A project for image classification.",
+    description="A project for crack segmentation using SAMba-UNet architecture.",
     long_description="A longer description of your project.",
     long_description_content_type="text/markdown",
     url="https://github.com/your/project",

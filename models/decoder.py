@@ -1,13 +1,14 @@
-'''
-Author: Hui Liu
-Github: https://github.com/Karl1109
-Email: liuhui@ieee.org
-'''
+# Copyright (c) Roy. All rights reserved.
+#
+# This source code is licensed under the license found in the
+# LICENSE file in the root directory of this source tree.
 
 import torch
 from torch import nn
+import torch.nn.functional as F
 from mmcls.SAVSS_dev.models.SAVSS.SAVSS import SAVSS
 from models.MFS import MFS
+
 # 模型整体输入的维度为 [B, 3, 512, 512]   输出的维度为 [B, 1, 512, 512]
 class Decoder(nn.Module):
     def __init__(self, backbone, args=None):
@@ -19,6 +20,10 @@ class Decoder(nn.Module):
     def forward(self, samples):                     # samples: 一批图像，samples shape: [B, 3, 512, 512]
         outs_SAVSS = self.backbone(samples)         # 注意这里的outs_SAVSS是SAVSS的输出，是一个字典，包括了4个不同阶段的输出([B,16,512,512], [B,32,256,256], [B,64,128,128], [B,128,64,64])
         out = self.MFS(outs_SAVSS)                  # 调用 MFS 头部进行分割 out shape: [B,1,512,512]
+
+        # 将输出大小调整为与输入图像大小一致，以处理动态分辨率
+        _, _, H, W = samples.shape
+        out = F.interpolate(out, size=(H, W), mode='bilinear', align_corners=False)
 
         return out
 
@@ -45,6 +50,10 @@ class bce_dice(nn.Module):
         self.args = args
 
     def forward(self, y_pred, y_true):
+        # 如果预测和标签的尺寸不匹配，将预测上采样到标签的尺寸
+        if y_pred.shape[-2:] != y_true.shape[-2:]:
+            y_pred = F.interpolate(y_pred, size=y_true.shape[-2:], mode='bilinear', align_corners=False)
+
         bce = self.bce_fn(y_pred, y_true)
         dice = self.dice_fn(y_pred.sigmoid(), y_true)
         return self.args.BCELoss_ratio * bce + self.args.DiceLoss_ratio * dice

@@ -1,5 +1,6 @@
 import os.path
 import cv2
+import random
 from PIL import Image
 from .base_dataset import BaseDataset
 import torchvision.transforms as transforms
@@ -7,74 +8,87 @@ from .image_folder import make_dataset
 from .utils import MaskToTensor
 
 class CrackDataset(BaseDataset):
-    """A dataset class for crack dataset."""
+    """A dataset class for crack dataset with dynamic 80/20 splitting."""
 
     def __init__(self, args):
         """Initialize this dataset class.
 
-        Parameters:
-            args (Option class) -- stores all the experiment flags; needs to be a subclass of BaseOptions
+        This class now handles dynamic splitting of the dataset into training and
+        validation sets based on a fixed random seed.
         """
         BaseDataset.__init__(self, args)
-        self.img_paths = make_dataset(os.path.join(args.dataset_path, '{}_img'.format(args.phase)))
-        self.lab_dir = os.path.join(args.dataset_path, '{}_lab'.format(args.phase))
-        self.img_transforms = transforms.Compose([transforms.ToTensor(),
-                                                  transforms.Normalize((0.5, 0.5, 0.5),
-                                                                       (0.5, 0.5, 0.5))])
-        self.lab_transform = MaskToTensor()
 
+        # --- START: New data splitting logic ---
+
+        # 1. Define common directories. We assume all images are in '.../img/'
+        #    and all labels are in '.../lab/'.
+        img_dir = os.path.join(args.dataset_path, 'img')
+        self.lab_dir = os.path.join(args.dataset_path, 'lab')
+
+        if not os.path.isdir(img_dir):
+            raise FileNotFoundError(f"Image directory not found: {img_dir}. Please ensure your data is in 'data/crack500/img/'.")
+        if not os.path.isdir(self.lab_dir):
+            raise FileNotFoundError(f"Label directory not found: {self.lab_dir}. Please ensure your data is in 'data/crack500/lab/'.")
+
+        # 2. Get all image paths and shuffle them reproducibly.
+        all_img_paths = sorted(make_dataset(img_dir))
+        random.Random(args.seed).shuffle(all_img_paths)
+
+        # 3. Calculate the 80% split point.
+        split_idx = int(len(all_img_paths) * 0.8)
+        if len(all_img_paths) == 0:
+            raise ValueError(f"No images found in {img_dir}.")
+
+        # 4. Assign the correct slice of paths based on the current phase.
+        if args.phase == 'train':
+            self.img_paths = all_img_paths[:split_idx]
+            print(f"Dataset: Using {len(self.img_paths)} images for training (80% of total).")
+        elif args.phase == 'test':
+            self.img_paths = all_img_paths[split_idx:]
+            print(f"Dataset: Using {len(self.img_paths)} images for validation (20% of total).")
+        else:
+            # Default behavior if phase is not train/test, e.g., for prediction.
+            self.img_paths = all_img_paths
+
+        # --- END: New data splitting logic ---
+
+        # 使用 ImageNet 的标准均值和方差，以匹配 SAM/Hiera 预训练模型的要求
+        self.img_transforms = transforms.Compose([
+            transforms.ToTensor(),
+            transforms.Normalize([0.485, 0.456, 0.406], [0.229, 0.224, 0.225])
+        ])
+        self.lab_transform = MaskToTensor()
         self.phase = args.phase
 
     def __getitem__(self, index):
-        """
-        Return a data point and its metadata information.
-
-        Parameters:
-            index - - a random integer for data indexing
-
-        Returns a dictionary that contains A, B, A_paths and B_paths
-            image (tensor) - - an image
-            label (tensor) - - its corresponding segmentation
-            A_paths (str) - - image paths
-            B_paths (str) - - image paths (same as A_paths)
-        """
-        # read a image given a random integer index
+        """Return a data point and its metadata information."""
         img_path = self.img_paths[index]
-
-        # --- START: 修改区域 ---
-
-        # 1. 从图像路径中分离出文件名（不含后缀）
         base_filename = os.path.splitext(os.path.basename(img_path))[0]
-
-        # 2. 使用这个不含后缀的文件名来拼接标签路径，并确保标签后缀是.png
-        lab_path = os.path.join(self.lab_dir, base_filename + '.png')
-
-        # --- END: 修改区域 ---
+        lab_path = os.path.join(self.lab_dir, base_filename + '.jpg')
 
         img = cv2.imread(img_path, cv2.IMREAD_UNCHANGED)
-        # 如果图像是灰度图，确保它被转换为3通道BGR图像
         if len(img.shape) == 2:
             img = cv2.cvtColor(img, cv2.COLOR_GRAY2BGR)
         img = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
 
-        # 增加一个检查，确保标签文件存在
         if not os.path.exists(lab_path):
-            raise FileNotFoundError(f"标签文件未找到！请为图片 {img_path} 检查对应的标签文件路径: {lab_path}")
+            # Try to find the corresponding .png file if .jpg is not found
+            lab_path_png = os.path.join(self.lab_dir, base_filename + '.png')
+            if os.path.exists(lab_path_png):
+                lab_path = lab_path_png
+            else:
+                raise FileNotFoundError(f"Label file not found for image {img_path}. Looked for: {lab_path} and {lab_path_png}")
 
         lab = cv2.imread(lab_path, cv2.IMREAD_UNCHANGED)
-
         if len(lab.shape) == 3:
             lab = cv2.cvtColor(lab, cv2.COLOR_BGR2GRAY)
 
-        # adjust the image size
         w, h = self.args.load_width, self.args.load_height
-        # 确保尺寸不为0
         if w > 0 and h > 0:
             img = cv2.resize(img, (w, h), interpolation=cv2.INTER_CUBIC)
             lab = cv2.resize(lab, (w, h), interpolation=cv2.INTER_CUBIC)
 
         _, lab = cv2.threshold(lab, 127, 255, cv2.THRESH_BINARY)
-        # 将标签转换为 0 和 1
         _, lab = cv2.threshold(lab, 127, 1, cv2.THRESH_BINARY)
 
         img = self.img_transforms(Image.fromarray(img.copy()))
