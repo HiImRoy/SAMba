@@ -1,0 +1,19 @@
+# IDE settings
+.idea/
+
+# Python cache
+__pycache__/
+*.pyc
+
+# Build artifacts
+*.egg-info/
+
+# Local data and results
+data/*
+!data/.gitkeep
+results/*
+!results/.gitkeep
+checkpoint_TUT/*
+!checkpoint_TUT/.gitkeep
+/data/
+/results/
