@@ -1,255 +1,157 @@
 import numpy as np
 import os
-import logging
 import glob
 import cv2
+from tqdm import tqdm
 
-def cal_global_acc(pred, gt):
-    h,w = gt.shape
-    return [np.sum(pred==gt), float(h*w)]
+def calculate_metrics(pred_list, gt_list, num_cls=2):
+    """
+    A unified and efficient function to calculate segmentation metrics including
+    mIoU, ODS, OIS, and the associated Precision, Recall, and F1-score.
 
-def get_statistics_seg(pred, gt, num_cls=2):
-    h,w = gt.shape
-    statistics = []
-    for i in range(num_cls):
-        tp = np.sum((pred==i)&(gt==i))
-        fp = np.sum((pred==i)&(gt!=i))
-        fn = np.sum((pred!=i)&(gt==i))
-        statistics.append([tp, fp, fn])
-    return statistics
+    This function iterates through thresholds only once to calculate all metrics.
+    """
+    # Statistics for ODS (per threshold, over all images)
+    # Each element is [TP, FP, FN] for a given threshold
+    stats_ods = [[0, 0, 0] for _ in range(256)]
 
-def get_statistics_prf(pred, gt):
-    tp = np.sum((pred==1)&(gt==1))
-    fp = np.sum((pred==1)&(gt==0))
-    fn = np.sum((pred==0)&(gt==1))
-    return [tp, fp, fn]
+    # Statistics for OIS (per image, per threshold)
+    # Shape: (num_images, num_thresholds, 3) where 3 is for [TP, FP, FN]
+    stats_ois = np.zeros((len(pred_list), 256, 3), dtype=np.int64)
 
-def segment_metrics(pred_list, gt_list, num_cls = 2):
-    global_accuracy_cur = []
-    statistics = []
+    # Statistics for mIoU (per threshold, over all images)
+    # Each element is [TP, FP, FN, TN] for a given threshold
+    stats_miou = [[0, 0, 0, 0] for _ in range(256)]
 
-    for pred, gt in zip(pred_list, gt_list):
-        gt_img = (gt / 255).astype('uint8')
-        pred_img = (pred / 255).astype('uint8')
-        global_accuracy_cur.append(cal_global_acc(pred_img, gt_img))
-        statistics.append(get_statistics_seg(pred_img, gt_img, num_cls))
+    # Pre-convert ground truth images to binary
+    gt_binary_list = [(gt / 255).astype('uint8') for gt in gt_list]
 
+    # Iterate over each image pair
+    for i, (pred_prob, gt_binary) in enumerate(zip(pred_list, gt_binary_list)):
+        # Iterate over each possible threshold (0-255)
+        for thresh in range(256):
+            # Threshold the probability map to get a binary prediction
+            pred_binary = (pred_prob > thresh).astype('uint8')
 
-    global_acc = np.sum([v[0] for v in global_accuracy_cur]) / np.sum([v[1] for v in global_accuracy_cur])
-    counts = []
-    for i in range(num_cls):
-        tp = np.sum([v[i][0] for v in statistics])
-        fp = np.sum([v[i][1] for v in statistics])
-        fn = np.sum([v[i][2] for v in statistics])
+            # Calculate TP, FP, FN, TN for the current image at the current threshold
+            tp = np.sum((pred_binary == 1) & (gt_binary == 1))
+            fp = np.sum((pred_binary == 1) & (gt_binary == 0))
+            fn = np.sum((pred_binary == 0) & (gt_binary == 1))
+            tn = np.sum((pred_binary == 0) & (gt_binary == 0))
 
-        counts.append([tp, fp, fn])
+            # Accumulate stats for ODS
+            stats_ods[thresh][0] += tp
+            stats_ods[thresh][1] += fp
+            stats_ods[thresh][2] += fn
 
-    mean_acc = np.sum([v[0] / (v[0] + v[2]) for v in counts]) / num_cls
-    mean_iou_acc = np.sum([v[0] / (np.sum(v)) for v in counts]) / num_cls
+            # Store stats for OIS
+            stats_ois[i, thresh, 0] = tp
+            stats_ois[i, thresh, 1] = fp
+            stats_ois[i, thresh, 2] = fn
 
-    return global_acc, mean_acc, mean_iou_acc
+            # Accumulate stats for mIoU
+            stats_miou[thresh][0] += tp
+            stats_miou[thresh][1] += fp
+            stats_miou[thresh][2] += fn
+            stats_miou[thresh][3] += tn
 
-def prf_metrics(pred_list, gt_list):
-    statistics = []
+    # --- Post-computation for ODS, Precision, Recall ---
+    p_ods, r_ods, f1_ods = [], [], []
+    for tp, fp, fn in stats_ods:
+        p = tp / (tp + fp) if (tp + fp) > 0 else 0
+        r = tp / (tp + fn) if (tp + fn) > 0 else 0
+        f1 = 2 * p * r / (p + r) if (p + r) > 0 else 0
+        p_ods.append(p)
+        r_ods.append(r)
+        f1_ods.append(f1)
 
-    for pred, gt in zip(pred_list, gt_list):
-        gt_img = (gt / 255).astype('uint8')
-        pred_img = (((pred / np.max(pred))>0.5)).astype('uint8')
-        statistics.append(get_statistics_prf(pred_img, gt_img))
+    # Find the best threshold for ODS
+    best_thresh_idx_ods = np.argmax(f1_ods)
+    ods_f1 = f1_ods[best_thresh_idx_ods]
+    ods_precision = p_ods[best_thresh_idx_ods]
+    ods_recall = r_ods[best_thresh_idx_ods]
 
-    tp = np.sum([v[0] for v in statistics])
-    fp = np.sum([v[1] for v in statistics])
-    fn = np.sum([v[2] for v in statistics])
-    print("tp:{}, fp:{}, fn:{}".format(tp,fp,fn))
-    p_acc = 1.0 if tp == 0 and fp == 0 else tp / (tp + fp)
-    r_acc = tp / (tp + fn)
-    f_acc = 2 * p_acc * r_acc / (p_acc + r_acc)
-    return p_acc,r_acc,f_acc
+    # --- Post-computation for OIS ---
+    f1_ois_per_image = []
+    for i in range(len(pred_list)):
+        tp = stats_ois[i, :, 0]
+        fp = stats_ois[i, :, 1]
+        fn = stats_ois[i, :, 2]
+        p_ois = np.divide(tp, tp + fp, out=np.zeros_like(tp, dtype=float), where=(tp + fp) != 0)
+        r_ois = np.divide(tp, tp + fn, out=np.zeros_like(tp, dtype=float), where=(tp + fn) != 0)
+        f1_ois = np.divide(2 * p_ois * r_ois, p_ois + r_ois, out=np.zeros_like(p_ois, dtype=float), where=(p_ois + r_ois) != 0)
+        f1_ois_per_image.append(np.max(f1_ois))
+    ois_f1 = np.mean(f1_ois_per_image)
 
+    # --- Post-computation for mIoU ---
+    miou_list = []
+    for tp, fp, fn, tn in stats_miou:
+        iou_1 = tp / (tp + fp + fn) if (tp + fp + fn) > 0 else 0
+        iou_0 = tn / (tn + fn + fp) if (tn + fn + fp) > 0 else 0
+        miou_list.append((iou_1 + iou_0) / 2)
+    best_miou = np.max(miou_list)
 
-def cal_prf_metrics(pred_list, gt_list, thresh_step=0.01):
-    final_accuracy_all = []
-    for thresh in np.arange(0.0, 1.0, thresh_step):
-        statistics = []
-        for pred, gt in zip(pred_list, gt_list):
-            gt_img = (gt / 255).astype('uint8')
-            pred_img = (pred / 255 > thresh).astype('uint8')
-            statistics.append(get_statistics(pred_img, gt_img))
-        tp = np.sum([v[0] for v in statistics])
-        fp = np.sum([v[1] for v in statistics])
-        fn = np.sum([v[2] for v in statistics])
-
-        p_acc = 1.0 if tp == 0 and fp == 0 else tp / (tp + fp)
-        r_acc = tp / (tp + fn)
-        final_accuracy_all.append([thresh, p_acc, r_acc, 2 * p_acc * r_acc / (p_acc + r_acc)])
-
-    return final_accuracy_all
-
-def thred_half(src_img_list, tgt_img_list):
-    Precision, Recall, F_score = prf_metrics(src_img_list, tgt_img_list)
-    Global_Accuracy, Class_Average_Accuracy, Mean_IOU = segment_metrics(src_img_list, tgt_img_list)
-    print("Global Accuracy:{}, Class Average Accuracy:{}, Mean IOU:{}, Precision:{}, Recall:{}, F score:{}".format(
-        Global_Accuracy, Class_Average_Accuracy, Mean_IOU, Precision, Recall, F_score))
-
-def get_statistics(pred, gt):
-    tp = np.sum((pred==1)&(gt==1))
-    fp = np.sum((pred==1)&(gt==0))
-    fn = np.sum((pred==0)&(gt==1))
-    return [tp, fp, fn]
-
-def cal_OIS_metrics(pred_list, gt_list, thresh_step=0.01):
-    final_F1_list = []
-    for pred, gt in zip(pred_list, gt_list):
-        p_acc_list = []
-        r_acc_list = []
-        F1_list = []
-        for thresh in np.arange(0.0, 1.0, thresh_step):
-            gt_img = (gt / 255).astype('uint8')
-            pred_img = (pred / 255 > thresh).astype('uint8')
-            tp, fp, fn = get_statistics(pred_img, gt_img)
-            p_acc = 1.0 if tp == 0 and fp == 0 else tp / (tp + fp)
-            if tp + fn == 0:
-                r_acc=0
-            else:
-                r_acc = tp / (tp + fn)
-            if p_acc + r_acc==0:
-                F1 = 0
-            else:
-                F1 = 2 * p_acc * r_acc / (p_acc + r_acc)
-
-            p_acc_list.append(p_acc)
-            r_acc_list.append(r_acc)
-            F1_list.append(F1)
-
-        assert len(p_acc_list)==100, "p_acc_list is not 100"
-        assert len(r_acc_list)==100, "r_acc_list is not 100"
-        assert len(F1_list)==100, "F1_list is not 100"
-
-        max_F1 = np.max(np.array(F1_list))
-        final_F1_list.append(max_F1)
-
-    final_F1 = np.sum(np.array(final_F1_list))/len(final_F1_list)
-    return final_F1
-
-def cal_ODS_metrics(pred_list, gt_list, thresh_step=0.01):
-    save_data = {
-        "ODS": [],
+    # --- MODIFIED: Return the best threshold as well ---
+    return {
+        'mIoU': best_miou,
+        'ODS': ods_f1,          # This is the main F1-score
+        'OIS': ois_f1,
+        'F1': ods_f1,           # Report ODS F1 as the primary F1
+        'Precision': ods_precision, # Precision at the best ODS threshold
+        'Recall': ods_recall,       # Recall at the best ODS threshold
+        'best_threshold': best_thresh_idx_ods # The optimal threshold (0-255)
     }
-    final_ODS = []
-    for thresh in np.arange(0.0, 1.0, thresh_step):
-        ODS_list = []
-        for pred, gt in zip(pred_list, gt_list):
-            gt_img = (gt / 255).astype('uint8')
-            pred_img = (pred / 255 > thresh).astype('uint8')
-            tp, fp, fn = get_statistics(pred_img, gt_img)
-            # calculate precision
-            p_acc = 1.0 if tp == 0 and fp == 0 else tp / (tp + fp)
-            if tp + fn == 0:
-                r_acc=0
-            else:
-                r_acc = tp / (tp + fn)
-            if p_acc + r_acc==0:
-                F1 = 0
-            else:
-                F1 = 2 * p_acc * r_acc / (p_acc + r_acc)
-            ODS_list.append(F1)
 
-        ave_F1 = np.mean(np.array(ODS_list))
-        final_ODS.append(ave_F1)
-    ODS = np.max(np.array(final_ODS))
-    return ODS
+def imread(path, load_mode=cv2.IMREAD_GRAYSCALE):
+    """Helper to read image."""
+    return cv2.imread(path, load_mode)
 
-def cal_mIoU_metrics(pred_list, gt_list, thresh_step=0.01, pred_imgs_names=None, gt_imgs_names=None):
-    final_iou = []
-    for thresh in np.arange(0.0, 1.0, thresh_step):
-        iou_list = []
-        for i, (pred, gt) in enumerate(zip(pred_list, gt_list)):
-            gt_img = (gt / 255).astype('uint8')
-            pred_img = (pred / 255 > thresh).astype('uint8')
-            TP = np.sum((pred_img == 1) & (gt_img == 1))
-            TN = np.sum((pred_img == 0) & (gt_img == 0))
-            FP = np.sum((pred_img == 1) & (gt_img == 0))
-            FN = np.sum((pred_img == 0) & (gt_img == 1))
-            if (FN + FP + TP) <= 0:
-                iou = 0
-            else:
-                iou_1 = TP / (FN + FP + TP)
-                iou_0 = TN / (FN + FP + TN)
-                iou = (iou_1 + iou_0)/2
-            iou_list.append(iou)
-        ave_iou = np.mean(np.array(iou_list))
-        final_iou.append(ave_iou)
-    mIoU = np.max(np.array(final_iou))
-    return mIoU
+def get_image_pairs(data_dir, suffix_gt, suffix_pred):
+    """Loads prediction and ground truth images from a directory."""
+    # Use os.path.join for robust path construction
+    gt_paths = glob.glob(os.path.join(data_dir, f'*{suffix_gt}.png'))
+    
+    if not gt_paths:
+        print(f"Warning: No ground truth files found in {data_dir} with suffix '{suffix_gt}.png'.")
+        return [], []
 
-def imread(path, load_size=0, load_mode=cv2.IMREAD_GRAYSCALE, convert_rgb=False, thresh=-1):
-    im = cv2.imread(path, load_mode)
-    if convert_rgb:
-        im = cv2.cvtColor(im, cv2.COLOR_BGR2RGB)
-    if load_size > 0:
-        im = cv2.resize(im, (load_size, load_size), interpolation=cv2.INTER_CUBIC)
-    if thresh > 0:
-        _, im = cv2.threshold(im, thresh, 255, cv2.THRESH_BINARY)
-    return im
+    pred_paths = [p.replace(suffix_gt, suffix_pred) for p in gt_paths]
+    
+    pred_imgs = [imread(p) for p in tqdm(pred_paths, desc="Loading Predictions")]
+    gt_imgs = [imread(p) for p in tqdm(gt_paths, desc="Loading Ground Truth")]
 
-def get_image_pairs(data_dir, suffix_gt='real_B', suffix_pred='fake_B'):
-    gt_list = glob.glob(os.path.join(data_dir, '*{}.png'.format(suffix_gt)))
-    pred_list = [ll.replace(suffix_gt, suffix_pred) for ll in gt_list]
-    assert len(gt_list) == len(pred_list)
-    pred_imgs, gt_imgs = [], []
-    pred_imgs_names, gt_imgs_names = [], []
-    for pred_path, gt_path in zip(pred_list, gt_list):
-        pred_imgs.append(imread(pred_path))
-        gt_imgs.append(imread(gt_path, thresh=127))
-        pred_imgs_names.append(pred_path)
-        gt_imgs_names.append(gt_path)
-    return pred_imgs, gt_imgs, pred_imgs_names, gt_imgs_names
+    # Filter out pairs where an image failed to load
+    loaded_pred_imgs = [img for img in pred_imgs if img is not None]
+    loaded_gt_imgs = [gt_imgs[i] for i, img in enumerate(pred_imgs) if img is not None]
+
+    if len(loaded_pred_imgs) != len(pred_paths):
+        print(f"Warning: Some prediction images could not be loaded.")
+
+    return loaded_pred_imgs, loaded_gt_imgs
 
 def eval(log_eval, results_dir, epoch):
+    """Main evaluation function called by main.py."""
+    suffix_gt = "_lab"
+    suffix_pred = "_pre"
+    log_eval.info(f"Evaluating results in: {results_dir}")
 
-    suffix_gt = "lab"
-    suffix_pred = "pre"
-    log_eval.info(results_dir)
-    log_eval.info("checkpoints -> " + results_dir)
-    src_img_list, tgt_img_list, pred_imgs_names, gt_imgs_names = get_image_pairs(results_dir, suffix_gt, suffix_pred)
-    assert len(src_img_list) == len(tgt_img_list)
-    final_accuracy_all = cal_prf_metrics(src_img_list, tgt_img_list)
-    final_accuracy_all = np.array(final_accuracy_all)
-    Precision_list, Recall_list, F_list = final_accuracy_all[:, 1], final_accuracy_all[:,2], final_accuracy_all[:, 3]
-    mIoU = cal_mIoU_metrics(src_img_list, tgt_img_list, pred_imgs_names=pred_imgs_names, gt_imgs_names=gt_imgs_names)
-    ODS = cal_ODS_metrics(src_img_list, tgt_img_list)
-    OIS = cal_OIS_metrics(src_img_list, tgt_img_list)
-    log_eval.info("mIouU -> " + str(mIoU))
-    log_eval.info("ODS -> " + str(ODS))
-    log_eval.info("OIS -> " + str(OIS))
-    log_eval.info("F1 -> " + str(F_list[0]))
-    log_eval.info("P -> " + str(Precision_list[0]))
-    log_eval.info("R -> " + str(Recall_list[0]))
-    log_eval.info("eval finish!")
+    # Load raw probability maps (as uint8) and ground truth maps
+    pred_list, gt_list = get_image_pairs(results_dir, suffix_gt, suffix_pred)
 
-    return {'epoch': epoch, 'mIoU': mIoU, 'ODS': ODS, 'OIS': OIS, 'F1': F_list[0], 'Precision': Precision_list[0], 'Recall': Recall_list[0]}
+    if not pred_list or not gt_list:
+        log_eval.warning("Evaluation skipped: No image pairs found.")
+        return {'epoch': epoch, 'mIoU': 0, 'ODS': 0, 'OIS': 0, 'F1': 0, 'Precision': 0, 'Recall': 0, 'best_threshold': 127}
 
-if __name__ == '__main__':
-    suffix_gt = "lab"
-    suffix_pred = "pre"
-    results_dir = "../results/results_test/TUT_results"
-    logging.info(results_dir)
-    src_img_list, tgt_img_list, pred_imgs_names, gt_imgs_names = get_image_pairs(results_dir, suffix_gt, suffix_pred)
-    assert len(src_img_list) == len(tgt_img_list)
-    final_accuracy_all = cal_prf_metrics(src_img_list, tgt_img_list)
-    final_accuracy_all = np.array(final_accuracy_all)
-    Precision_list, Recall_list, F_list = final_accuracy_all[:,1], final_accuracy_all[:,2], final_accuracy_all[:,3]
-    mIoU = cal_mIoU_metrics(src_img_list,tgt_img_list, pred_imgs_names=pred_imgs_names, gt_imgs_names=gt_imgs_names)
-    ODS = cal_ODS_metrics(src_img_list, tgt_img_list)
-    OIS = cal_OIS_metrics(src_img_list, tgt_img_list)
-    print("mIouU -> " + str(mIoU))
-    print("ODS -> " + str(ODS))
-    print("OIS -> " + str(OIS))
-    print("F1 -> " + str(F_list[0]))
-    print("P -> " + str(Precision_list[0]))
-    print("R -> " + str(Recall_list[0]))
-    print("eval finish!")
+    # Calculate all metrics in one go
+    metrics = calculate_metrics(pred_list, gt_list)
+    metrics['epoch'] = epoch
 
+    log_eval.info(f"mIoU -> {metrics['mIoU']:.4f}")
+    log_eval.info(f"ODS -> {metrics['ODS']:.4f}")
+    log_eval.info(f"OIS -> {metrics['OIS']:.4f}")
+    log_eval.info(f"Precision (at ODS) -> {metrics['Precision']:.4f}")
+    log_eval.info(f"Recall (at ODS) -> {metrics['Recall']:.4f}")
+    log_eval.info(f"Best Threshold (for ODS) -> {metrics['best_threshold']}")
+    log_eval.info("Evaluation finished!")
 
-    
-
+    return metrics

@@ -166,8 +166,6 @@ class MFS(nn.Module):
         self.linear_c2 = MLP(input_dim=64, embed_dim=embedding_dim)
         self.linear_c1 = MLP(input_dim=32, embed_dim=embedding_dim)
         self.GBC_C = GBC(embedding_dim*4)
-        self.GBC_8 = GBC(8, norm_type='IN')
-        self.GN_C = nn.GroupNorm(num_channels=embedding_dim*4, num_groups=embedding_dim*4//16)
         self.linear_fuse = BottConv(embedding_dim*4, embedding_dim, embedding_dim//8, kernel_size=1, padding=0, stride=1)
 
         self.linear_pred = BottConv(embedding_dim, 1, 1, kernel_size=1, padding=0, stride=1)
@@ -179,7 +177,7 @@ class MFS(nn.Module):
         self.DySample_C_4 = DySample(embedding_dim, scale=4)
         self.DySample_C_8 = DySample(embedding_dim, scale=8)
 
-    def forward(self, inputs):
+    def forward(self, inputs, final_size):
         c4, c3, c2, c1 = inputs # c4是最高层(最小)，c1是最低层(最大)
         b, c, h, w = c4.shape
         out_c4 = self.linear_c4(c4.reshape(b, c, h*w).permute(0, 2, 1)).permute(0, 2, 1).reshape(b, self.embedding_dim, h, w)
@@ -196,17 +194,20 @@ class MFS(nn.Module):
         b, c, h, w = c1.shape
         out_c1 = self.linear_c1(c1.reshape(b, c, h*w).permute(0, 2, 1)).permute(0, 2, 1).reshape(b, self.embedding_dim, h, w)
 
-        # 拼接所有上采样后的特征图并进行融合
-        out_c = self.GBC_C(torch.cat([out_c4, out_c3, out_c2, out_c1], dim=1))
+        # 拼接所有在 112x112 尺度上的特征图
+        fused_low_res = torch.cat([out_c4, out_c3, out_c2, out_c1], dim=1)
+
+        # --- MODIFIED: Upsample to full resolution BEFORE final fusion ---
+        full_res_features = F.interpolate(fused_low_res, size=final_size, mode='bilinear', align_corners=False)
+
+        # --- MODIFIED: Perform all final computations on the full resolution feature map ---
+        out_c = self.GBC_C(full_res_features)
         out_c = self.linear_fuse(out_c)
 
         out_c = self.dropout(out_c)
         x = self.linear_pred_1(self.linear_pred(out_c))
 
-        # 将输出大小调整为与最大特征图 (c1) 相同
-        _, _, H, W = c1.shape
-        x = F.interpolate(x, size=(H, W), mode='bilinear', align_corners=False)
-
+        # No final interpolation needed as we are already at full resolution
         return x
 
 logger = logging.getLogger(__name__)
@@ -340,15 +341,9 @@ class SAMbaCrack(nn.Module):
 
         # 将特征按 C4, C3, C2, C1 的顺序送入解码器
         decoder_input = (projected_features[3], projected_features[2], projected_features[1], projected_features[0])
-        logits = self.decoder(decoder_input)
-
-        # --- 最终上采样，以匹配输入图像的尺寸 ---
-        logits = F.interpolate(
-            logits,
-            size=x.shape[-2:],  # 获取原始输入 x 的空间维度
-            mode='bilinear',
-            align_corners=False
-        )
+        
+        # --- MODIFIED: Pass final size to decoder and get full-resolution output directly ---
+        logits = self.decoder(decoder_input, final_size=x.shape[-2:])
 
         return logits
 

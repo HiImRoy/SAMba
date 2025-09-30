@@ -20,7 +20,8 @@ from models import build_model
 from datasets import create_dataset
 from eval.evaluate import eval
 from util.logger import get_logger
-# REMOVED: from mmengine.optim.scheduler.lr_scheduler import PolyLR
+# --- RE-ADDED: PolyLR for stable training ---
+from mmengine.optim.scheduler.lr_scheduler import PolyLR
 
 # --- Helper Functions --- #
 
@@ -102,24 +103,33 @@ def save_plots(log_df, output_dir):
     plt.savefig(output_dir / 'metrics_curve.png')
     plt.close()
 
-def save_best_masks(model, device, args, output_dir):
-    """Saves stitched prediction and label masks for the best model."""
-    print(f"Saving validation masks for the best model to {output_dir}...")
+# --- MODIFIED: Function now accepts the best_threshold from ODS calculation ---
+
+def save_best_masks(model, device, args, output_dir, best_threshold):
+    """Saves stitched prediction and label masks for the best model using the optimal threshold."""
+    print(f"Saving validation masks for the best model to {output_dir} (using ODS threshold: {best_threshold})...")
     model.eval()
     args.phase = 'test'
     args.batch_size = 1
     test_dl = create_dataset(args)
     
+    # Convert the 0-255 integer threshold to a 0.0-1.0 float threshold
+    float_threshold = best_threshold / 255.0
+
     with torch.no_grad():
         for data in tqdm(test_dl, desc="Generating best masks"):
             x, target = data["image"].to(device), data["label"].to(device)
             out = model(x)
 
             label_np = target[0, 0].cpu().numpy()
-            pred_np = torch.sigmoid(out)[0, 0].cpu().numpy()
+            
+            # --- MODIFIED: Apply the optimal ODS threshold for visualization ---
+            prob_map = torch.sigmoid(out)
+            binary_map = (prob_map > float_threshold).float()
+            pred_np_for_vis = binary_map[0, 0].cpu().numpy()
 
             label_vis = (255 * (label_np / (label_np.max() + 1e-8))).astype(np.uint8)
-            pred_vis = (255 * pred_np).astype(np.uint8)
+            pred_vis = (255 * pred_np_for_vis).astype(np.uint8)
 
             label_rgb = cv2.cvtColor(label_vis, cv2.COLOR_GRAY2BGR)
             pred_rgb = cv2.cvtColor(pred_vis, cv2.COLOR_GRAY2BGR)
@@ -138,9 +148,9 @@ def get_args_parser():
     parser.add_argument('--model_name', default='SAMbaCrack', type=str)
     parser.add_argument('--pretrained_weights', type=str, default='sam2_checkpoints/sam2.1_hiera_small.pt', help='Path to the pretrained Hiera weights.')
     
-    # Balanced loss ratios for faster convergence
-    parser.add_argument('--BCELoss_ratio', default=0.5, type=float, help="Weight for BCE Loss in the total loss function.")
-    parser.add_argument('--DiceLoss_ratio', default=0.5, type=float, help="Weight for Dice Loss in the total loss function.")
+    # --- REVERTED: Loss ratios reverted to original values ---
+    parser.add_argument('--BCELoss_ratio', default=0.83, type=float, help="Weight for BCE Loss in the total loss function.")
+    parser.add_argument('--DiceLoss_ratio', default=0.17, type=float, help="Weight for Dice Loss in the total loss function.")
     
     parser.add_argument('--Norm_Type', default='GN', type=str)
     parser.add_argument('--dataset_path', default="data/crack500")
@@ -148,21 +158,24 @@ def get_args_parser():
     parser.add_argument('--batch_size_train', type=int, default=8)
     parser.add_argument('--batch_size_test', type=int, default=8)
 
-    # --- MODIFIED: Switched to OneCycleLR --- #
-    parser.add_argument('--lr_scheduler', type=str, default='OneCycleLR', help='LR scheduler to use.')
-    parser.add_argument('--lr', default=8e-4, type=float, help="The maximum learning rate for OneCycleLR.")
+    # --- REVERTED: Switched back to PolyLR --- #
+    parser.add_argument('--lr_scheduler', type=str, default='PolyLR', help='LR scheduler to use.')
+    parser.add_argument('--lr', default=5e-4, type=float, help="The initial learning rate for PolyLR.")
     
-    # --- ADDED: Gradient Clipping --- #
+    # Gradient Clipping is kept as a stability improvement
     parser.add_argument('--clip_grad_norm', default=1.0, type=float, help="Gradient clipping norm value (0 for no clipping).")
 
     # Added argument for differential learning rate
     parser.add_argument('--lr_backbone_multiplier', default=0.1, type=float, help="Multiplier for the learning rate of fine-tuned parts (e.g., SAM adapters).")
     
-    parser.add_argument('--min_lr', default=1e-6, type=float) # This is now used by PolyLR if you switch back
+    parser.add_argument('--min_lr', default=1e-6, type=float)
     parser.add_argument('--weight_decay', default=0.01, type=float)
     # Epoch数
     parser.add_argument('--epochs', default=100, type=int)
     parser.add_argument('--start_epoch', default=0, type=int)
+
+    # --- ADDED: Argument for resuming training --- #
+    parser.add_argument('--resume', default='', type=str, help='Path to checkpoint to resume training from.')
 
     parser.add_argument('--lr_drop', default=30, type=int)
     parser.add_argument('--sgd', action='store_true')
@@ -179,11 +192,16 @@ def get_args_parser():
 
 def main(args):
     # 1. SETUP DIRECTORY STRUCTURE
-    cur_time = datetime.datetime.now().strftime('%Y%m%d-%H%M%S')
-    dataset_name = Path(args.dataset_path).name
-    exp_name = f"{cur_time}_{args.model_name}_{dataset_name}"
+    # --- MODIFIED: If resuming, use the existing output directory ---
+    if args.resume:
+        output_dir = Path(args.resume).parent.parent
+        exp_name = output_dir.name
+    else:
+        cur_time = datetime.datetime.now().strftime('%Y%m%d-%H%M%S')
+        dataset_name = Path(args.dataset_path).name
+        exp_name = f"{cur_time}_{args.model_name}_{dataset_name}"
+        output_dir = Path(args.output_dir) / exp_name
 
-    output_dir = Path(args.output_dir) / exp_name
     weights_dir = output_dir / 'weights'
     masks_dir = output_dir / 'best_epoch_masks'
     plots_dir = output_dir / 'plots'
@@ -213,8 +231,8 @@ def main(args):
     model, criterion = build_model(args)
     model.to(device)
 
-    # --- LOAD PRETRAINED WEIGHTS ---
-    if hasattr(model, 'init_weights'):
+    # --- LOAD PRETRAINED WEIGHTS (Only if not resuming) ---
+    if hasattr(model, 'init_weights') and not args.resume:
         log.info(f"Initializing weights... Will use pretrained weights if path is provided.")
         model.init_weights(args.pretrained_weights)
 
@@ -231,10 +249,7 @@ def main(args):
     log.info("--- Setting up Optimizer with Differential Learning Rate ---")
 
     # Group parameters for differential learning rate
-    # Fine-tune parameters are from the SAM refiners and adapters
     finetune_param_ids = set(map(id, model.refiners.parameters())) | set(map(id, model.adapters.parameters()))
-
-    # Scratch parameters are all other trainable parameters
     scratch_params = [p for p in model.parameters() if p.requires_grad and id(p) not in finetune_param_ids]
     finetune_params = [p for p in model.parameters() if p.requires_grad and id(p) in finetune_param_ids]
 
@@ -244,27 +259,20 @@ def main(args):
     ]
 
     optimizer = torch.optim.AdamW(param_dicts, lr=args.lr, weight_decay=args.weight_decay)
+    lr_scheduler = PolyLR(optimizer, eta_min=args.min_lr, begin=args.start_epoch, end=args.epochs)
 
-    # Log the parameter groups for verification
-    num_scratch_params = sum(p.numel() for p in scratch_params)
-    num_finetune_params = sum(p.numel() for p in finetune_params)
-    log.info(f"Optimizer: AdamW with base_lr={args.lr}, weight_decay={args.weight_decay}")
-    log.info(f"  - Scratch Group ({num_scratch_params/1e6:.3f}M params) lr: {args.lr}")
-    log.info(f"  - Finetune Group ({num_finetune_params/1e6:.3f}M params) lr: {args.lr * args.lr_backbone_multiplier}")
-    log.info("----------------------------------------------------------\n")
-
-    # --- REPLACED: PolyLR with OneCycleLR --- #
-    log.info(f"--- Setting up OneCycleLR Scheduler ---")
-    log.info(f"Max LR: {args.lr}, Epochs: {args.epochs}, Steps per Epoch: {len(train_dataLoader)}")
-    lr_scheduler = torch.optim.lr_scheduler.OneCycleLR(
-        optimizer,
-        max_lr=[g['lr'] for g in optimizer.param_groups], # Pass max_lr for each param group
-        steps_per_epoch=len(train_dataLoader),
-        epochs=args.epochs,
-        pct_start=0.3, # Use 30% of steps for warm-up
-        div_factor=25, # Initial LR is max_lr / 25
-        final_div_factor=1e4 # Final LR is max_lr / 1e4
-    )
+    # --- ADDED: Logic for resuming from a checkpoint ---
+    if args.resume:
+        if os.path.isfile(args.resume):
+            log.info(f"--- Resuming training from checkpoint: {args.resume} ---")
+            checkpoint = torch.load(args.resume, map_location='cpu')
+            model.load_state_dict(checkpoint['model'])
+            optimizer.load_state_dict(checkpoint['optimizer'])
+            lr_scheduler.load_state_dict(checkpoint['lr_scheduler'])
+            args.start_epoch = checkpoint['epoch'] + 1
+            log.info(f"--- Resumed successfully. Starting from epoch {args.start_epoch} ---")
+        else:
+            log.warning(f"Checkpoint file not found at {args.resume}. Starting from scratch.")
 
     # 6. TRAINING LOOP
     log.info("--- Starting Training ---")
@@ -276,9 +284,8 @@ def main(args):
     for epoch in range(args.start_epoch, args.epochs):
         epoch_start_time = time.time()
         log.info(f"\n===== Epoch {epoch}/{args.epochs - 1} =====")
-        # --- UPDATED: Pass the scheduler to the training function --- #
-        train_stats = train_one_epoch(model, criterion, train_dataLoader, optimizer, lr_scheduler, epoch, args, log)
-        # --- REMOVED: lr_scheduler.step() is now called inside train_one_epoch --- #
+        train_stats = train_one_epoch(model, criterion, train_dataLoader, optimizer, epoch, args, log)
+        lr_scheduler.step()
 
         if device.type == 'cuda':
             log.info(f"GPU Memory: Allocated={torch.cuda.memory_allocated(0)/1024**2:.1f}MB, Peak={torch.cuda.max_memory_allocated(0)/1024**2:.1f}MB")
@@ -294,39 +301,56 @@ def main(args):
             model.eval()
             for data in tqdm(test_dl, desc=f"Testing Epoch {epoch}"):
                 x, target = data["image"].to(device), data["label"].cpu().numpy()
-                out = model(x).cpu().numpy()
+                out = model(x)
+                
+                # --- MODIFIED: Save raw probability map for eval ---
+                prob_map_0_1 = torch.sigmoid(out)
+                
+                # Save the raw probability map (0-255) for the new eval function
+                prob_map_uint8 = (prob_map_0_1[0, 0] * 255).cpu().numpy().astype(np.uint8)
                 root_name = data["A_paths"][0].split("/")[-1][0:-4]
-                cv2.imwrite(str(temp_eval_dir / f"{root_name}_pre.png"), (255 * out[0, 0]).astype(np.uint8))
-                cv2.imwrite(str(temp_eval_dir / f"{root_name}_lab.png"), (255 * target[0, 0]).astype(np.uint8))
+                cv2.imwrite(str(temp_eval_dir / f"{root_name}_pre.png"), prob_map_uint8)
+                
+                # Save the ground truth for eval
+                cv2.imwrite(str(temp_eval_dir / f"{root_name}_lab.png"), (target[0, 0] * 255).astype(np.uint8))
 
         current_epoch_metrics = eval(log, str(temp_eval_dir), epoch)
         
-        # --- MODIFIED: Replaced with a formatted epoch summary --- #
-        log.info(f"---------- Epoch {epoch} Summary ----------")
-        log.info(f"  - Train Loss: {train_stats['loss']:.4f}")
-        log.info(f"  - mIoU:       {current_epoch_metrics.get('mIoU', 0):.4f}")
-        log.info(f"  - ODS:        {current_epoch_metrics.get('ODS', 0):.4f}")
-        log.info(f"  - OIS:        {current_epoch_metrics.get('OIS', 0):.4f}")
-        log.info(f"  - F1:         {current_epoch_metrics.get('F1', 0):.4f}")
-        log.info(f"  - Precision:  {current_epoch_metrics.get('Precision', 0):.4f}")
-        log.info(f"  - Recall:     {current_epoch_metrics.get('Recall', 0):.4f}")
-        log.info(f"-----------------------------------")
+        print(f"\n" + "-"*25 + f" Epoch {epoch} Summary " + "-"*25)
+        print(f"  - Train Loss: {train_stats['loss']:.4f}")
+        print(f"  - mIoU:       {current_epoch_metrics.get('mIoU', 0.0):.4f}")
+        print(f"  - ODS (F1):   {current_epoch_metrics.get('ODS', 0.0):.4f}")
+        print(f"  - OIS (F1):   {current_epoch_metrics.get('OIS', 0.0):.4f}")
+        print(f"  - Precision:  {current_epoch_metrics.get('Precision', 0.0):.4f}")
+        print(f"  - Recall:     {current_epoch_metrics.get('Recall', 0.0):.4f}")
+        print(f"  - Best Thresh:{current_epoch_metrics.get('best_threshold', -1)}")
+        print("-"*70 + f"\n")
+
+        log.info(f"Epoch {epoch} Validation Metrics: {current_epoch_metrics}")
 
         log_entry = {'epoch': epoch, 'train_loss': train_stats['loss'], **current_epoch_metrics}
         log_data.append(log_entry)
 
-        utils.save_on_master({
-            'model': model.state_dict(), 'epoch': epoch
-        }, weights_dir / 'checkpoint_last.pth')
+        # --- MODIFIED: Save optimizer and scheduler state in checkpoint ---
+        checkpoint_payload = {
+            'model': model.state_dict(),
+            'optimizer': optimizer.state_dict(),
+            'lr_scheduler': lr_scheduler.state_dict(),
+            'epoch': epoch
+        }
+        utils.save_on_master(checkpoint_payload, weights_dir / 'checkpoint_last.pth')
 
-        # --- MODIFIED: Make robust to missing keys --- #
         if current_epoch_metrics.get('mIoU', 0) > best_mIoU:
             best_mIoU = current_epoch_metrics.get('mIoU', 0)
             best_metrics_from_best_mIoU_epoch = current_epoch_metrics
             log.info(f"*** New best mIoU: {best_mIoU:.4f} at epoch {epoch}! Saving best model and masks. ***")
 
-            utils.save_on_master({'model': model.state_dict()}, weights_dir / 'checkpoint_best.pth')
-            save_best_masks(model, device, args, masks_dir)
+            # Save the best model checkpoint with the full payload as well
+            utils.save_on_master(checkpoint_payload, weights_dir / 'checkpoint_best.pth')
+            
+            # --- MODIFIED: Pass the optimal threshold to the saving function ---
+            best_threshold_for_saving = best_metrics_from_best_mIoU_epoch.get('best_threshold', 127)
+            save_best_masks(model, device, args, masks_dir, best_threshold_for_saving)
 
         log.info(f"Epoch {epoch} finished in {(time.time() - epoch_start_time):.2f}s. Current best mIoU: {best_mIoU:.4f}")
 
@@ -338,11 +362,6 @@ def main(args):
         best_precision = best_metrics_from_best_mIoU_epoch.get('Precision', 0)
         best_recall = best_metrics_from_best_mIoU_epoch.get('Recall', 0)
 
-        if (best_precision + best_recall) > 0:
-            recalculated_f1 = 2 * (best_precision * best_recall) / (best_precision + best_recall)
-        else:
-            recalculated_f1 = 0.0
-
         final_report = {
             'Best_Epoch': best_metrics_from_best_mIoU_epoch.get('epoch'),
             'mIoU': best_metrics_from_best_mIoU_epoch.get('mIoU'),
@@ -350,7 +369,8 @@ def main(args):
             'OIS': best_metrics_from_best_mIoU_epoch.get('OIS'),
             'Precision': best_precision,
             'Recall': best_recall,
-            'F1_Score (Recalculated)': recalculated_f1
+            'F1_Score (from Best Epoch)': best_metrics_from_best_mIoU_epoch.get('F1', 0.0),
+            'Best_Threshold': best_metrics_from_best_mIoU_epoch.get('best_threshold', -1)
         }
 
         log.info("--- Best Model Performance (based on max mIoU) ---")
