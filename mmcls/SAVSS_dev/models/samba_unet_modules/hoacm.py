@@ -1,9 +1,11 @@
+# Author: Roy
 # Copyright (c) Roy. All rights reserved.
 #
 # This source code is licensed under the license found in the
 # LICENSE file in the root directory of this source tree.
 
 # 该文件根据 SAMba-UNet 论文中的详细描述进行了修订。
+# 根据用户需求进行了轻量化修改。
 
 import torch
 import torch.nn as nn
@@ -12,7 +14,8 @@ import torch.nn.functional as F
 
 class InvertedResidualMLP(nn.Module):
     """倒置残差 MLP 块，用作 HOACM 的最终处理步骤。"""
-    def __init__(self, dim, mlp_ratio=4.0, act_layer=nn.GELU, drop=0.0):
+    # 根据用户要求，将 mlp_ratio 的默认值从 4.0 修改为 2.0，以减少模型参数量。
+    def __init__(self, dim, mlp_ratio=2.0, act_layer=nn.GELU, drop=0.0):
         super().__init__()
         hidden_dim = int(dim * mlp_ratio) # 隐藏层维度
         # 1x1 卷积，用于升维
@@ -96,8 +99,17 @@ class OmniscientContextualAttention(nn.Module):
         super().__init__()
         # 门控空间注意力 (GSA) 卷积 (公式 17)
         self.gsa_conv = nn.Conv2d(2, 2, kernel_size=7, padding=3)
-        # 最终注意力图卷积 (公式 17, 最后部分)
-        self.final_conv = nn.Conv2d(2, dim, kernel_size=7, padding=3)
+        
+        # **轻量化修改**: 最终注意力图卷积 (公式 17, 最后部分)
+        # 原始实现: self.final_conv = nn.Conv2d(2, dim, kernel_size=7, padding=3)
+        # 根据用户要求，使用深度可分离卷积替换7x7标准卷积，以大幅减少参数量。
+        # 这由一个深度卷积 (逐通道) 和一个逐点卷积 (1x1) 组成。
+        self.final_conv = nn.Sequential(
+            # 1. 深度卷积：在每个输入通道上独立应用 7x7 卷积
+            nn.Conv2d(in_channels=2, out_channels=2, kernel_size=7, padding=3, groups=2, bias=False),
+            # 2. 逐点卷积：使用 1x1 卷积来组合通道信息并扩展到目标维度
+            nn.Conv2d(in_channels=2, out_channels=dim, kernel_size=1, bias=False)
+        )
 
     def forward(self, x_sam):
         # 双通道压缩 (公式 13, 14)
@@ -128,7 +140,9 @@ class HOACM(nn.Module):
     该模块使用修订后的 OCA 和 BSEA 子模块，
     融合来自 SAM (Hiera) 和 Mamba (SAVSS) 编码器的特征。
     """
-    def __init__(self, dim, mlp_ratio=4.0, drop=0.0):
+    # 根据用户要求，将 mlp_ratio 的默认值从 4.0 修改为 2.0，以减少模型参数量。
+    # 这个比例会被传递给下面的 InvertedResidualMLP 模块。
+    def __init__(self, dim, mlp_ratio=2.0, drop=0.0):
         super().__init__()
         self.oca = OmniscientContextualAttention(dim) # 全知上下文注意力
         self.bsea = BifurcatedSelectiveEmphasisAttention(dim) # 分叉选择性强调注意力

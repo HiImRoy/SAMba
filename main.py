@@ -40,39 +40,46 @@ def log_parameter_summary(model, log):
     log.info("-----------------------------")
 
     # --- Manual calculation for SAVSS Input Stage ---
-    savss_input_total = sum(p.numel() for p in model.savss_patch_embed.parameters()) + model.savss_pos_embed.numel()
-    savss_input_trainable = sum(p.numel() for p in model.savss_patch_embed.parameters() if p.requires_grad) + (model.savss_pos_embed.numel() if model.savss_pos_embed.requires_grad else 0)
-    
-    trainable_percentage = 0
-    if savss_input_total > 0:
-        trainable_percentage = (savss_input_trainable / savss_input_total) * 100
+    # 使用 hasattr 进行安全检查，以防模块不存在
+    if hasattr(model, 'savss_patch_embed') and hasattr(model, 'savss_pos_embed'):
+        savss_input_total = sum(p.numel() for p in model.savss_patch_embed.parameters()) + model.savss_pos_embed.numel()
+        savss_input_trainable = sum(p.numel() for p in model.savss_patch_embed.parameters() if p.requires_grad) + (model.savss_pos_embed.numel() if model.savss_pos_embed.requires_grad else 0)
+        
+        trainable_percentage = 0
+        if savss_input_total > 0:
+            trainable_percentage = (savss_input_trainable / savss_input_total) * 100
 
-    log.info(f"  - SAVSS Input (PatchEmbed + PosEmbed):")
-    log.info(f"    - Total params: {savss_input_total / 1e6:.3f}M")
-    log.info(f"    - Trainable params: {savss_input_trainable / 1e6:.3f}M ({trainable_percentage:.2f}%)")
+        log.info(f"  - SAVSS Input (PatchEmbed + PosEmbed):")
+        log.info(f"    - Total params: {savss_input_total / 1e6:.3f}M")
+        log.info(f"    - Trainable params: {savss_input_trainable / 1e6:.3f}M ({trainable_percentage:.2f}%)")
 
-    # Breakdown by other modules
+    # **修复**: 恢复模块参数的详细打印功能。
+    # - 使用正确的模块映射，反映最新的模型结构。
+    # - 移除了之前导致错误的、不必要的 if 条件。
     module_map = {
-        "SAM Encoder (Frozen)": model.sam_encoder,
-        "SAM Refiners": model.refiners,
-        "SAM Adapters": model.adapters,
-        "SAVSS Encoder (Mamba)": model.mamba_encoder,
-        "Fusion (HOACM)": model.hoacms,
-        "Decoder Projections": model.projections,
-        "Decoder (MFS)": model.decoder
+        "SAM Encoder (Frozen)": "sam_encoder",
+        "SAM Refiners": "refiners",
+        "SAM MLP Adapters": "adapters",
+        "SAM Downscale Adapters": "sam_adapters",
+        "SAVSS Encoder (Mamba)": "mamba_encoder",
+        "Fusion (HOACM)": "hoacms",
+        "Decoder (MFS)": "decoder"
     }
 
-    for name, module in module_map.items():
-        module_total = sum(p.numel() for p in module.parameters())
-        module_trainable = sum(p.numel() for p in module.parameters() if p.requires_grad)
+    for name, attr_name in module_map.items():
+        # 使用 hasattr 检查模型是否真的有这个属性，让代码更健壮
+        if hasattr(model, attr_name):
+            module = getattr(model, attr_name)
+            module_total = sum(p.numel() for p in module.parameters())
+            module_trainable = sum(p.numel() for p in module.parameters() if p.requires_grad)
 
-        trainable_percentage = 0
-        if module_total > 0:
-            trainable_percentage = (module_trainable / module_total) * 100
+            trainable_percentage = 0
+            if module_total > 0:
+                trainable_percentage = (module_trainable / module_total) * 100
 
-        log.info(f"  - {name}:")
-        log.info(f"    - Total params: {module_total / 1e6:.3f}M")
-        log.info(f"    - Trainable params: {module_trainable / 1e6:.3f}M ({trainable_percentage:.2f}%)")
+            log.info(f"  - {name}:")
+            log.info(f"    - Total params: {module_total / 1e6:.3f}M")
+            log.info(f"    - Trainable params: {module_trainable / 1e6:.3f}M ({trainable_percentage:.2f}%)")
 
     log.info("------------------------------------\n")
 
@@ -149,8 +156,8 @@ def get_args_parser():
     parser.add_argument('--pretrained_weights', type=str, default='sam2_checkpoints/sam2.1_hiera_small.pt', help='Path to the pretrained Hiera weights.')
     
     # --- REVERTED: Loss ratios reverted to original values ---
-    parser.add_argument('--BCELoss_ratio', default=0.83, type=float, help="Weight for BCE Loss in the total loss function.")
-    parser.add_argument('--DiceLoss_ratio', default=0.17, type=float, help="Weight for Dice Loss in the total loss function.")
+    parser.add_argument('--BCELoss_ratio', default=0.17, type=float, help="Weight for BCE Loss in the total loss function.")
+    parser.add_argument('--DiceLoss_ratio', default=0.83, type=float, help="Weight for Dice Loss in the total loss function.")
     
     parser.add_argument('--Norm_Type', default='GN', type=str)
     parser.add_argument('--dataset_path', default="data/crack500")

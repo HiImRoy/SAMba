@@ -1,75 +1,66 @@
-# Project Brief: SAMbaCrack - A Novel Crack Segmentation Model
+# 项目简报: 对现有 SAMbaCrack 代码进行轻量化重构
 
-Hello Gemini, we are building a new deep learning model for high-precision road crack segmentation, named **SAMbaCrack**. Please act as my expert PyTorch co-pilot for this task.
+你好 Gemini，我们将共同对一个已有的 PyTorch 模型项目进行优化。请作为我的专家级编程助手。
 
-Our project is based on the existing `SCSegamba` codebase, but we will replace its original single encoder with a more powerful dual-encoder architecture inspired by the `SAMba-UNet` paper.
+**当前状态**: 我有一个名为 `SAMbaCrack` 的项目，代码已经可以运行。但模型的参数量过大（可训练参数约 29M），训练效率低且不稳定。
 
----
+**核心目标**: **大幅削减模型的可训练参数量**，目标是将其降低到 **15M 以内**，同时尽量保持模型的性能。
 
-### **Overall Architecture**
+**改造策略**: 我们将通过修改现有代码，对参数量最大的几个模块 `SAVSS` 和 `HOACM` 进行针对性的轻量化重构。
 
-The target model `SAMbaCrack` will be an **Encoder-Decoder** architecture.
-
-- **Encoder**: A dual-path encoder that processes the input image in parallel.
-  - **Path 1**: A **SAM2 Encoder** (based on Hiera architecture), pre-trained on natural images, responsible for extracting fine-grained local details and textures. We will apply parameter-efficient fine-tuning (PEFT) to it.
-  - **Path 2**: A **Mamba Encoder** (based on `SCSegamba`'s `SAVSS_layer`), responsible for capturing long-range dependencies and the global context of cracks.
-  - **Fusion**: A **HOACM** (Heterogeneous Omni-Attention Convergence Module) will be used at each stage to intelligently fuse the features from the SAM2 and Mamba paths.
-- **Decoder**: We will use the **MFSHead** (Multi-scale Feature Segmentation Head) from `SCSegamba` to decode the fused features and generate the final segmentation map.
+**核心要求**:
+1.  **请用中文回答我的所有问题。**
+2.  **请为你修改的所有代码添加详细的中文注释，解释修改了什么。**
+3.  **请将所有修改过的文件头部的作者信息 (`Author`) 修改为 `Roy`。**
 
 ---
 
-### **Task 1: Implement the Core Modules**
+### **任务1: 轻量化 `SAVSS` 骨干网络**
 
-Before we build the final model, we need to implement the new modules. Please help me create the following files and classes in the `/samba_unet_modules/` directory.
+这是降低参数量的第一步，也是最关键的一步。
 
-#### **File: `/samba_unet_modules/hiera.py`**
+**目标文件**: `@file /mmcls/models/backbones/SAVSS.py`
 
-Create a `Hiera` class that inherits from `nn.Module`. This will be our SAM2 Encoder. The implementation should be a standard hierarchical Vision Transformer. The `forward_features` method must return a list or tuple of 4 feature maps from the 4 stages.
+**请帮我修改 `SAVSS.py` 文件，具体要求如下**:
 
-#### **File: `/samba_unet_modules/refiner_adapter.py`**
+1.  **修改 `__init__` 方法的默认参数**:
+    *   找到 `class SAVSS(BaseBackbone):` 的 `__init__` 方法。
+    *   将其参数 `dims` 的默认值从 `(96, 192, 384, 768)` **修改为 `(32, 64, 128, 256)`**。
+    *   将其参数 `depths` 的默认值从 `(2, 2, 6, 2)` **修改为 `(2, 2, 2, 2)`**。
+2.  **验证参数量**: 在 `__init__` 方法的末尾，请保留或添加打印总参数量的代码，以便我们能立刻看到修改后的效果。
 
-Create two classes in this file:
-1.  `DynamicFeatureFusionRefiner(nn.Module)`: Implement this based on the `SAMba-UNet` paper's architecture (dual-pooling, channel attention, spatial enhancement path, residual connection).
-2.  `MLPAdapter(nn.Module)`: A simple `Linear -> GeLU -> Linear` adapter module.
-
-#### **File: `/samba_unet_modules/hoacm.py`**
-
-Create the `HOACM(nn.Module)` class. This is the most complex module.
-- It should contain sub-modules: `BifurcatedSelectiveEmphasisAttention` (BSEA) and `OmniscientContextualAttention` (OCA).
-- The `forward` method must accept two inputs, `x_sam` and `x_mamba`, and fuse them according to the `SAMba-UNet` paper's diagram.
+请生成修改后的完整 `SAVSS.py` 文件内容。
 
 ---
 
-### **Task 2: Assemble the Main Model**
+### **任务2: 轻量化 `HOACM` 融合模块**
 
-Now, help me create the main model file that assembles all the components.
+`HOACM` 是另一个参数大户，我们需要对其进行内部优化。
 
-#### **File: `/mmcls/SAVSS_dev/models/SAVSS/SAMbaCrack.py`**
+**目标文件**: `@file /samba_unet_modules/hoacm.py`
 
-Create the main model class `SAMbaCrack(nn.Module)`.
+**请帮我修改 `hoacm.py` 文件，具体要求如下**:
 
--   **`__init__` method**:
-    -   Instantiate `Hiera` as `self.sam_encoder`.
-    -   Instantiate `nn.ModuleList` of `Refiner` and `Adapter` for each of the 4 stages.
-    -   Instantiate a Mamba Encoder `self.mamba_encoder` by stacking `SAVSS_layer` and `DownSample` modules for 4 stages.
-    -   Instantiate an `nn.ModuleList` of `HOACM` for each of the 4 stages.
-    -   Instantiate the `MFSHead` from `SCSegamba`'s code as `self.decoder`.
--   **`forward` method**:
-    -   Implement the full data flow: parallel encoding through SAM2 and Mamba paths, feature refinement/adaptation for SAM2 features, stage-wise fusion using HOACM, and finally decoding with the MFSHead.
-    -   The method should return the final segmentation logits.
+1.  **优化 `InvertedResidualMLP`**:
+    *   找到 `InvertedResidualMLP` 类的 `__init__` 方法。
+    *   将其 `mlp_ratio` (MLP扩展率) 的默认值从 `4.0` **修改为 `2.0`**。这将直接使其参数量减半。
+2.  **优化 `OmniscientContextualAttention` (OCA)**:
+    *   找到 `OCA` 类的 `__init__` 方法。
+    *   其中有一个 `self.final_conv = nn.Conv2d(2, dim, ...)`，它的输出通道数是 `dim`，参数量较大。
+    *   请在这里应用**瓶颈设计**：
+        *   添加一个新的 `bottleneck_dim = dim // 4`。
+        *   将 `self.final_conv` 修改为一个 `nn.Sequential`，包含：
+            1.  一个 `nn.Conv2d(2, bottleneck_dim, kernel_size=1)`
+            2.  一个 `nn.Conv2d(bottleneck_dim, dim, kernel_size=7, padding=3)`
+    *   **或者 (更优方案)**: 将 `self.final_conv` 的 `7x7` 标准卷积替换为**深度可分离卷积**，以大幅减少参数。
 
-Let's start with **Task 1**, beginning with the `hiera.py` file. Please generate the code for it.
+请优先采用**深度可分离卷积**的方案来优化 OCA，并生成修改后的完整 `hoacm.py` 文件内容。
 
-# 最重要的一点：用中文回答所有问题，并且给所有你浏览过的代码加上中文注释，把作者改成Roy
+---
 
-## Gemini生成的实现时需要特别注意的关键点
-你的设计在理论上非常完美，但在将它翻译成代码时，有几个细节需要特别小心处理，否则容易出错：
-1. 维度对齐 (Dimension Alignment): 这是最最关键的一点。正如你之前的分析，Hiera 和 SAVSS 的 Patch Embedding 策略不同，导致它们在同一阶段输出的特征图空间分辨率完全不同。
-解决方案: 在将 sam_features 和 mamba_features 送入 HOACM 之前，必须使用 torch.nn.functional.interpolate 将分辨率较小的特征图（Hiera的输出）上采样到与分辨率较大的特征图（SAVSS的输出）完全一致。
-检查点: 确保每个 HOACM 模块接收到的两个输入的 H 和 W 是完全相同的。
-2. 通道数对齐:
-你需要确保在每个阶段，Hiera 输出的通道数和 SAVSS 输出的通道数是一致的，这样 HOACM 才能处理。这通常需要在定义两个编码器时，就规划好每个阶段的输出维度。例如，都遵循 [96, 192, 384, 768] 这样的通道演进策略。
-3. 参数冻结与优化器设置:
-一定要正确实现参数高效微调的逻辑。在创建优化器时，必须确保只有你希望训练的参数（Adapter, Refiner, HOACM, Mamba Encoder, Decoder）被传入，而 Hiera 的主体部分参数的 requires_grad 属性为 False。否则，你的模型会非常难以训练，甚至导致灾难性遗忘。
-4. 输入归一化 (Input Normalization):
-SAM/Hiera 是在特定的均值和方差下进行预训练的。你需要确保你的数据预处理流程中，对输入图像的归一化方式与 SAM 的要求一致。否则，预训练权重无法发挥最佳效果。
+### **任务3: 确认并开始执行**
+
+我们已经规划好了对 `SAVSS` 和 `HOACM` 的修改。
+
+**让我们从第一个任务开始：**
+请先执行**任务1**，为我生成修改后的 `/mmcls/models/backbones/SAVSS.py` 文件。
