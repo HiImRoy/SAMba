@@ -39,8 +39,6 @@ def log_parameter_summary(model, log):
         log.info(f"Trainable Ratio: {trainable_params / total_params * 100:.2f}%")
     log.info("-----------------------------")
 
-    # --- Manual calculation for SAVSS Input Stage ---
-    # 使用 hasattr 进行安全检查，以防模块不存在
     if hasattr(model, 'savss_patch_embed') and hasattr(model, 'savss_pos_embed'):
         savss_input_total = sum(p.numel() for p in model.savss_patch_embed.parameters()) + model.savss_pos_embed.numel()
         savss_input_trainable = sum(p.numel() for p in model.savss_patch_embed.parameters() if p.requires_grad) + (model.savss_pos_embed.numel() if model.savss_pos_embed.requires_grad else 0)
@@ -53,9 +51,6 @@ def log_parameter_summary(model, log):
         log.info(f"    - Total params: {savss_input_total / 1e6:.3f}M")
         log.info(f"    - Trainable params: {savss_input_trainable / 1e6:.3f}M ({trainable_percentage:.2f}%)")
 
-    # **修复**: 恢复模块参数的详细打印功能。
-    # - 使用正确的模块映射，反映最新的模型结构。
-    # - 移除了之前导致错误的、不必要的 if 条件。
     module_map = {
         "SAM Encoder (Frozen)": "sam_encoder",
         "SAM Refiners": "refiners",
@@ -63,11 +58,10 @@ def log_parameter_summary(model, log):
         "SAM Downscale Adapters": "sam_adapters",
         "SAVSS Encoder (Mamba)": "mamba_encoder",
         "Fusion (HOACM)": "hoacms",
-        "Decoder (MFS)": "decoder"
+        "Decoder": "decoder"
     }
 
     for name, attr_name in module_map.items():
-        # 使用 hasattr 检查模型是否真的有这个属性，让代码更健壮
         if hasattr(model, attr_name):
             module = getattr(model, attr_name)
             module_total = sum(p.numel() for p in module.parameters())
@@ -87,7 +81,6 @@ def save_plots(log_df, output_dir):
     """Generates and saves plots for loss and metrics."""
     plt.style.use('seaborn-v0_8-whitegrid')
     
-    # Plot Loss
     plt.figure(figsize=(12, 6))
     plt.plot(log_df['epoch'], log_df['train_loss'], marker='o', linestyle='-', label='Train Loss')
     plt.title('Training Loss Over Epochs')
@@ -97,8 +90,8 @@ def save_plots(log_df, output_dir):
     plt.savefig(output_dir / 'loss_curve.png')
     plt.close()
 
-    # Plot Metrics
-    metrics_to_plot = ['mIoU', 'ODS', 'OIS', 'F1', 'Precision', 'Recall']
+    # --- 【修改】: 在要绘制的指标列表中加入 'Foreground_IoU' ---
+    metrics_to_plot = ['mIoU', 'Foreground_IoU', 'ODS', 'OIS', 'F1', 'Precision', 'Recall']
     plt.figure(figsize=(12, 8))
     for metric in metrics_to_plot:
         if metric in log_df.columns:
@@ -110,8 +103,6 @@ def save_plots(log_df, output_dir):
     plt.savefig(output_dir / 'metrics_curve.png')
     plt.close()
 
-# --- MODIFIED: Function now accepts the best_threshold from ODS calculation ---
-
 def save_best_masks(model, device, args, output_dir, best_threshold):
     """Saves stitched prediction and label masks for the best model using the optimal threshold."""
     print(f"Saving validation masks for the best model to {output_dir} (using ODS threshold: {best_threshold})...")
@@ -119,8 +110,7 @@ def save_best_masks(model, device, args, output_dir, best_threshold):
     args.phase = 'test'
     args.batch_size = 1
     test_dl = create_dataset(args)
-    
-    # Convert the 0-255 integer threshold to a 0.0-1.0 float threshold
+
     float_threshold = best_threshold / 255.0
 
     with torch.no_grad():
@@ -129,8 +119,7 @@ def save_best_masks(model, device, args, output_dir, best_threshold):
             out = model(x)
 
             label_np = target[0, 0].cpu().numpy()
-            
-            # --- MODIFIED: Apply the optimal ODS threshold for visualization ---
+
             prob_map = torch.sigmoid(out)
             binary_map = (prob_map > float_threshold).float()
             pred_np_for_vis = binary_map[0, 0].cpu().numpy()
@@ -150,38 +139,30 @@ def save_best_masks(model, device, args, output_dir, best_threshold):
             cv2.imwrite(str(output_dir / root_name), stitched_image)
 
 def get_args_parser():
-    # The description is updated here
     parser = argparse.ArgumentParser('SAMBA FOR CRACK', add_help=False)
     parser.add_argument('--model_name', default='SAMbaCrack', type=str)
     parser.add_argument('--pretrained_weights', type=str, default='sam2_checkpoints/sam2.1_hiera_small.pt', help='Path to the pretrained Hiera weights.')
-    
-    # --- REVERTED: Loss ratios reverted to original values ---
-    parser.add_argument('--BCELoss_ratio', default=0.17, type=float, help="Weight for BCE Loss in the total loss function.")
-    parser.add_argument('--DiceLoss_ratio', default=0.83, type=float, help="Weight for Dice Loss in the total loss function.")
-    
+
+    parser.add_argument('--BCELoss_ratio', default=0.2, type=float, help="Weight for BCE Loss in the total loss function.")
+    parser.add_argument('--DiceLoss_ratio', default=0.8, type=float, help="Weight for Dice Loss in the total loss function.")
+
     parser.add_argument('--Norm_Type', default='GN', type=str)
     parser.add_argument('--dataset_path', default="data/crack500")
-    # Batch size
     parser.add_argument('--batch_size_train', type=int, default=8)
     parser.add_argument('--batch_size_test', type=int, default=8)
 
-    # --- REVERTED: Switched back to PolyLR --- #
     parser.add_argument('--lr_scheduler', type=str, default='PolyLR', help='LR scheduler to use.')
-    parser.add_argument('--lr', default=5e-4, type=float, help="The initial learning rate for PolyLR.")
-    
-    # Gradient Clipping is kept as a stability improvement
+    parser.add_argument('--lr', default=1e-4, type=float, help="The initial learning rate for PolyLR.")
+
     parser.add_argument('--clip_grad_norm', default=1.0, type=float, help="Gradient clipping norm value (0 for no clipping).")
 
-    # Added argument for differential learning rate
     parser.add_argument('--lr_backbone_multiplier', default=0.1, type=float, help="Multiplier for the learning rate of fine-tuned parts (e.g., SAM adapters).")
-    
+
     parser.add_argument('--min_lr', default=1e-6, type=float)
     parser.add_argument('--weight_decay', default=0.01, type=float)
-    # Epoch数
-    parser.add_argument('--epochs', default=100, type=int)
+    parser.add_argument('--epochs', default=200, type=int)
     parser.add_argument('--start_epoch', default=0, type=int)
 
-    # --- ADDED: Argument for resuming training --- #
     parser.add_argument('--resume', default='', type=str, help='Path to checkpoint to resume training from.')
 
     parser.add_argument('--lr_drop', default=30, type=int)
@@ -198,8 +179,6 @@ def get_args_parser():
     return parser
 
 def main(args):
-    # 1. SETUP DIRECTORY STRUCTURE
-    # --- MODIFIED: If resuming, use the existing output directory ---
     if args.resume:
         output_dir = Path(args.resume).parent.parent
         exp_name = output_dir.name
@@ -218,7 +197,6 @@ def main(args):
     masks_dir.mkdir(exist_ok=True)
     plots_dir.mkdir(exist_ok=True)
 
-    # 2. SETUP LOGGING
     log = get_logger(output_dir, 'experiment_log')
     log.info(f"Experiment started: {exp_name}")
     log.info(f"Results will be saved to: {output_dir}")
@@ -227,23 +205,19 @@ def main(args):
         log.info(f"{arg}: {value}")
     log.info("-----------------------\n")
 
-    # 3. SETUP DEVICE & SEED
     device = torch.device(args.device)
     torch.manual_seed(args.seed)
     np.random.seed(args.seed)
     random.seed(args.seed)
 
-    # 4. BUILD MODEL, LOAD WEIGHTS, & CREATE DATASET
     log.info("--- Building Model ---")
     model, criterion = build_model(args)
     model.to(device)
 
-    # --- LOAD PRETRAINED WEIGHTS (Only if not resuming) ---
     if hasattr(model, 'init_weights') and not args.resume:
         log.info(f"Initializing weights... Will use pretrained weights if path is provided.")
         model.init_weights(args.pretrained_weights)
 
-    # --- LOG PARAMETER BREAKDOWN ---
     log_parameter_summary(model, log)
 
     args.phase = 'train'
@@ -252,10 +226,6 @@ def main(args):
     log.info(f'The number of training images = {len(train_dataLoader.dataset)}')
     log.info(f'Number of training batches = {len(train_dataLoader)}')
 
-    # 5. SETUP OPTIMIZER & SCHEDULER
-    log.info("--- Setting up Optimizer with Differential Learning Rate ---")
-
-    # Group parameters for differential learning rate
     finetune_param_ids = set(map(id, model.refiners.parameters())) | set(map(id, model.adapters.parameters()))
     scratch_params = [p for p in model.parameters() if p.requires_grad and id(p) not in finetune_param_ids]
     finetune_params = [p for p in model.parameters() if p.requires_grad and id(p) in finetune_param_ids]
@@ -268,7 +238,6 @@ def main(args):
     optimizer = torch.optim.AdamW(param_dicts, lr=args.lr, weight_decay=args.weight_decay)
     lr_scheduler = PolyLR(optimizer, eta_min=args.min_lr, begin=args.start_epoch, end=args.epochs)
 
-    # --- ADDED: Logic for resuming from a checkpoint ---
     if args.resume:
         if os.path.isfile(args.resume):
             log.info(f"--- Resuming training from checkpoint: {args.resume} ---")
@@ -281,7 +250,6 @@ def main(args):
         else:
             log.warning(f"Checkpoint file not found at {args.resume}. Starting from scratch.")
 
-    # 6. TRAINING LOOP
     log.info("--- Starting Training ---")
     start_time = time.time()
     best_mIoU = 0.0
@@ -309,23 +277,22 @@ def main(args):
             for data in tqdm(test_dl, desc=f"Testing Epoch {epoch}"):
                 x, target = data["image"].to(device), data["label"].cpu().numpy()
                 out = model(x)
-                
-                # --- MODIFIED: Save raw probability map for eval ---
+
                 prob_map_0_1 = torch.sigmoid(out)
-                
-                # Save the raw probability map (0-255) for the new eval function
+
                 prob_map_uint8 = (prob_map_0_1[0, 0] * 255).cpu().numpy().astype(np.uint8)
                 root_name = data["A_paths"][0].split("/")[-1][0:-4]
                 cv2.imwrite(str(temp_eval_dir / f"{root_name}_pre.png"), prob_map_uint8)
-                
-                # Save the ground truth for eval
+
                 cv2.imwrite(str(temp_eval_dir / f"{root_name}_lab.png"), (target[0, 0] * 255).astype(np.uint8))
 
         current_epoch_metrics = eval(log, str(temp_eval_dir), epoch)
-        
+
+        # --- 【修改】: 在终端的 Epoch 总结中打印 Foreground_IoU ---
         print(f"\n" + "-"*25 + f" Epoch {epoch} Summary " + "-"*25)
         print(f"  - Train Loss: {train_stats['loss']:.4f}")
         print(f"  - mIoU:       {current_epoch_metrics.get('mIoU', 0.0):.4f}")
+        print(f"  - Fg IoU:     {current_epoch_metrics.get('Foreground_IoU', 0.0):.4f}") # 新增
         print(f"  - ODS (F1):   {current_epoch_metrics.get('ODS', 0.0):.4f}")
         print(f"  - OIS (F1):   {current_epoch_metrics.get('OIS', 0.0):.4f}")
         print(f"  - Precision:  {current_epoch_metrics.get('Precision', 0.0):.4f}")
@@ -338,7 +305,6 @@ def main(args):
         log_entry = {'epoch': epoch, 'train_loss': train_stats['loss'], **current_epoch_metrics}
         log_data.append(log_entry)
 
-        # --- MODIFIED: Save optimizer and scheduler state in checkpoint ---
         checkpoint_payload = {
             'model': model.state_dict(),
             'optimizer': optimizer.state_dict(),
@@ -352,16 +318,13 @@ def main(args):
             best_metrics_from_best_mIoU_epoch = current_epoch_metrics
             log.info(f"*** New best mIoU: {best_mIoU:.4f} at epoch {epoch}! Saving best model and masks. ***")
 
-            # Save the best model checkpoint with the full payload as well
             utils.save_on_master(checkpoint_payload, weights_dir / 'checkpoint_best.pth')
-            
-            # --- MODIFIED: Pass the optimal threshold to the saving function ---
+
             best_threshold_for_saving = best_metrics_from_best_mIoU_epoch.get('best_threshold', 127)
             save_best_masks(model, device, args, masks_dir, best_threshold_for_saving)
 
         log.info(f"Epoch {epoch} finished in {(time.time() - epoch_start_time):.2f}s. Current best mIoU: {best_mIoU:.4f}")
 
-    # 7. FINALIZATION
     total_time = time.time() - start_time
     log.info(f"--- Training Finished in {datetime.timedelta(seconds=int(total_time))} ---")
 
@@ -369,9 +332,11 @@ def main(args):
         best_precision = best_metrics_from_best_mIoU_epoch.get('Precision', 0)
         best_recall = best_metrics_from_best_mIoU_epoch.get('Recall', 0)
 
+        # --- 【修改】: 在最终的总结报告中也加入 Foreground_IoU ---
         final_report = {
             'Best_Epoch': best_metrics_from_best_mIoU_epoch.get('epoch'),
             'mIoU': best_metrics_from_best_mIoU_epoch.get('mIoU'),
+            'Foreground_IoU': best_metrics_from_best_mIoU_epoch.get('Foreground_IoU'), # 新增
             'ODS': best_metrics_from_best_mIoU_epoch.get('ODS'),
             'OIS': best_metrics_from_best_mIoU_epoch.get('OIS'),
             'Precision': best_precision,

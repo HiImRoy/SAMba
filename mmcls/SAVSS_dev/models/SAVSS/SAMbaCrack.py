@@ -4,7 +4,7 @@
 # This source code is licensed under the license found in the
 # LICENSE file in the root directory of this source tree.
 
-# 根据用户要求，此文件已重构，采用“精准增肥”策略以增加模型容量。
+# **重构**: 根据用户“方案一”要求，使用 U-Net 风格解码器替换 MFS，以强化分割细节。
 
 import torch
 import torch.nn as nn
@@ -21,189 +21,76 @@ from mmcls.SAVSS_dev.models.samba_unet_modules.refiner_adapter import DynamicFea
 from mmcls.SAVSS_dev.models.samba_unet_modules.hoacm import HOACM
 from mmcls.SAVSS_dev.models.SAVSS.SAVSS_layer import SAVSS_Layer
 
-# --- 从 models/GBC.py 内联 GBC 和 BottConv (MFS 和 SAVSS_layer 使用) ---
-class BottConv(nn.Module):
-    """瓶颈卷积块。"""
-    def __init__(self, in_channels, out_channels, mid_channels, kernel_size, padding, stride):
-        super(BottConv, self).__init__()
-        self.bott_conv = nn.Sequential(
-            nn.Conv2d(in_channels, mid_channels, kernel_size=1, stride=1, padding=0, bias=False),
-            nn.BatchNorm2d(mid_channels),
-            nn.ReLU(inplace=True),
-            nn.Conv2d(mid_channels, mid_channels, kernel_size=kernel_size, stride=stride, padding=padding, bias=False),
-            nn.BatchNorm2d(mid_channels),
-            nn.ReLU(inplace=True),
-            nn.Conv2d(mid_channels, out_channels, kernel_size=1, stride=1, padding=0, bias=False),
+# --- 【新增】U-Net 风格解码器模块，用于精细化特征重建 ---
+class DecoderBlock(nn.Module):
+    """U-Net 解码器的标准构建块。
+
+    它包含一个上采样层，然后与来自编码器路径的跳跃连接特征进行拼接，
+    最后通过一个卷积块进行处理。
+    """
+    def __init__(self, in_channels, skip_channels, out_channels):
+        super().__init__()
+        # 上采样层，将深层特征图的尺寸放大两倍
+        self.upsample = nn.Upsample(scale_factor=2, mode='bilinear', align_corners=True)
+        # 卷积块，输入通道数 = 上采样后的通道数 + 跳跃连接的通道数
+        self.conv = nn.Sequential(
+            nn.Conv2d(in_channels + skip_channels, out_channels, kernel_size=3, padding=1, bias=False),
             nn.BatchNorm2d(out_channels),
             nn.ReLU(inplace=True),
+            nn.Conv2d(out_channels, out_channels, kernel_size=3, padding=1, bias=False),
+            nn.BatchNorm2d(out_channels),
+            nn.ReLU(inplace=True)
         )
 
-    def forward(self, x):
-        return self.bott_conv(x)
+    def forward(self, x, skip):
+        """
+        Args:
+            x (torch.Tensor): 来自更深（下一层）解码器块的特征图。
+            skip (torch.Tensor): 来自编码器/融合器路径的、对应尺度的跳跃连接特征图。
+        """
+        x = self.upsample(x)
+        # 拼接上采样后的特征和跳跃连接特征
+        x = torch.cat([x, skip], dim=1)
+        return self.conv(x)
 
-class GBC(nn.Module):
-    """全局瓶颈卷积块。"""
-    def __init__(self, in_channels, out_channels=None, intermediate_channels=None, norm_type=None):
-        super(GBC, self).__init__()
-        self.in_channels = in_channels
-        self.out_channels = out_channels if out_channels is not None else in_channels
-        self.intermediate_channels = intermediate_channels if intermediate_channels is not None else in_channels // 4
-
-        self.gwc = BottConv(self.in_channels, self.out_channels, self.intermediate_channels, 3, 1, 1)
-        if norm_type == 'IN':
-            self.norm = nn.InstanceNorm2d(self.out_channels)
-        else:
-            self.norm = nn.BatchNorm2d(self.out_channels)
-        self.act = nn.GELU()
-
-    def forward(self, x):
-        res = x
-        x = self.gwc(x)
-        x = self.act(self.norm(x))
-        return x + res
-
-# --- 从 models/DySample.py 内联 DySample (已修复) ---
-def normal_init(module, mean=0, std=1, bias=0):
-    """正态分布初始化。"""
-    if hasattr(module, 'weight') and module.weight is not None:
-        nn.init.normal_(module.weight, mean, std)
-    if hasattr(module, 'bias') and module.bias is not None:
-        nn.init.constant_(module.bias, bias)
-
-def constant_init(module, val, bias=0):
-    """常量初始化。"""
-    if hasattr(module, 'weight') and module.weight is not None:
-        nn.init.constant_(module.weight, val)
-    if hasattr(module, 'bias') and module.bias is not None:
-        nn.init.constant_(module.bias, bias)
-
-class DySample(nn.Module):
-    """动态采样模块，用于上采样。"""
-    def __init__(self, in_channels, scale=2, style='lp', groups=4, dyscope=False):
+class UNetDecoder(nn.Module):
+    """U-Net 风格的解码器，逐级融合多尺度特征以重建分割细节。"""
+    def __init__(self, decoder_channels):
         super().__init__()
-        self.scale = scale
-        self.style = style
-        self.groups = groups
-        assert style in ['lp', 'pl']
-        if style == 'pl':
-            assert in_channels >= scale ** 2 and in_channels % scale ** 2 == 0
-        assert in_channels >= groups and in_channels % groups == 0
+        # decoder_channels 对应 c1, c2, c3, c4 的维度: [64, 128, 256, 512]
+        c1_dim, c2_dim, c3_dim, c4_dim = decoder_channels
 
-        if style == 'pl':
-            in_channels = in_channels // scale ** 2
-            out_channels = 2 * groups
-        else:
-            out_channels = 2 * groups * scale ** 2
+        # 解码器从最深层 (c4) 开始，逐级向上融合
+        # Block 1: 融合 c4 和 c3
+        self.block1 = DecoderBlock(in_channels=c4_dim, skip_channels=c3_dim, out_channels=c3_dim)
+        # Block 2: 融合 block1 的输出和 c2
+        self.block2 = DecoderBlock(in_channels=c3_dim, skip_channels=c2_dim, out_channels=c2_dim)
+        # Block 3: 融合 block2 的输出和 c1
+        self.block3 = DecoderBlock(in_channels=c2_dim, skip_channels=c1_dim, out_channels=c1_dim)
 
-        self.offset = nn.Conv2d(in_channels, out_channels, 1)
-        normal_init(self.offset, std=0.001)
-        if dyscope:
-            self.scope = nn.Conv2d(in_channels, out_channels, 1, bias=False)
-            constant_init(self.scope, val=0.)
+        # 分割头，将最终的高分辨率特征图转换为单通道的 logits
+        self.segmentation_head = nn.Conv2d(c1_dim, 1, kernel_size=1)
 
-        self.register_buffer('init_pos', self._init_pos())
+    def forward(self, features, final_size):
+        """
+        Args:
+            features (tuple): 包含4个尺度特征图的元组 (c4, c3, c2, c1)。
+            final_size (tuple): 最终输出 logits 需要被上采样到的目标尺寸 (H, W)。
+        """
+        c4, c3, c2, c1 = features
 
-    def _init_pos(self):
-        h = torch.arange((-self.scale + 1) / 2, (self.scale - 1) / 2 + 1) / self.scale
-        return torch.stack(torch.meshgrid([h, h], indexing='ij')).transpose(1, 2).repeat(1, self.groups, 1).reshape(1, -1, 1, 1)
+        # 解码路径
+        x = self.block1(c4, c3)    # 输出尺寸与 c3 相同
+        x = self.block2(x, c2)    # 输出尺寸与 c2 相同
+        x = self.block3(x, c1)    # 输出尺寸与 c1 相同 (e.g., 112x112)
 
-    def sample(self, x, offset):
-        B, _, H, W = offset.shape
-        offset = offset.reshape(B, 2, -1, H, W)
-        coords_h = torch.arange(H) + 0.5
-        coords_w = torch.arange(W) + 0.5
-        coords = torch.stack(torch.meshgrid([coords_w, coords_h], indexing='ij')
-                             ).transpose(1, 2).contiguous().unsqueeze(1).unsqueeze(0).type(x.dtype).to(x.device)
-        normalizer = torch.tensor([W, H], dtype=x.dtype, device=x.device).reshape(1, 2, 1, 1, 1)
-        coords = 2 * (coords + offset) / normalizer - 1
-        coords = F.pixel_shuffle(coords.reshape(B, -1, H, W), self.scale).reshape(
-            B, 2, -1, self.scale * H, self.scale * W).permute(0, 2, 3, 4, 1).contiguous().flatten(0, 1)
-        return F.grid_sample(x.reshape(B * self.groups, -1, H, W), coords, mode='bilinear',
-                             align_corners=False, padding_mode="border").reshape(B, -1, self.scale * H, self.scale * W)
+        # 应用分割头
+        logits = self.segmentation_head(x)
 
-    def forward_lp(self, x):
-        if hasattr(self, 'scope'):
-            offset = self.offset(x) * self.scope(x).sigmoid() * 0.5 + self.init_pos
-        else:
-            offset = self.offset(x) * 0.25 + self.init_pos
-        return self.sample(x, offset)
+        # 将 logits 上采样到原始输入图像的尺寸
+        logits = F.interpolate(logits, size=final_size, mode='bilinear', align_corners=False)
 
-    def forward_pl(self, x):
-        x_ = F.pixel_shuffle(x, self.scale)
-        if hasattr(self, 'scope'):
-            offset = F.pixel_unshuffle(self.offset(x_) * self.scope(x_).sigmoid(), self.scale) * 0.5 + self.init_pos
-        else:
-            offset = F.pixel_unshuffle(self.offset(x_), self.scale) * 0.25 + self.init_pos
-        return self.sample(x, offset)
-
-    def forward(self, x):
-        if self.style == 'pl':
-            return self.forward_pl(x)
-        return self.forward_lp(x)
-
-# --- 从 models/MFS.py 内联 MFS ---
-class MLP(nn.Module):
-    """多层感知机，用于特征维度映射。"""
-    def __init__(self, input_dim=2048, embed_dim=768):
-        super().__init__()
-        self.proj = nn.Linear(input_dim, embed_dim)
-
-    def forward(self, x):
-        x = self.proj(x)
-        return x
-
-class MFS(nn.Module):
-    """多尺度特征分割头 (MFSHead)。"""
-    # **修改**: 接受一个维度列表 `in_dims`，使其能够动态适应变化的编码器输出维度。
-    def __init__(self, embedding_dim, in_dims):
-        super(MFS, self).__init__()
-
-        self.embedding_dim = embedding_dim
-        # **修改**: 使用 `in_dims` 列表来动态设置每个 MLP 层的输入维度。
-        # `in_dims` 的顺序应与 `c1, c2, c3, c4` 的特征层级相对应。
-        self.linear_c1 = MLP(input_dim=in_dims[0], embed_dim=embedding_dim)
-        self.linear_c2 = MLP(input_dim=in_dims[1], embed_dim=embedding_dim)
-        self.linear_c3 = MLP(input_dim=in_dims[2], embed_dim=embedding_dim)
-        self.linear_c4 = MLP(input_dim=in_dims[3], embed_dim=embedding_dim)
-        
-        self.GBC_C = GBC(embedding_dim*4)
-        self.linear_fuse = BottConv(embedding_dim*4, embedding_dim, embedding_dim//8, kernel_size=1, padding=0, stride=1)
-
-        self.linear_pred = BottConv(embedding_dim, 1, 1, kernel_size=1, padding=0, stride=1)
-        self.linear_pred_1 = nn.Conv2d(1, 1, kernel_size=1)
-        self.dropout = nn.Dropout(p=0.1)
-
-        self.DySample_C_2 = DySample(embedding_dim, scale=2)
-        self.DySample_C_4 = DySample(embedding_dim, scale=4)
-        self.DySample_C_8 = DySample(embedding_dim, scale=8)
-
-    def forward(self, inputs, final_size):
-        # 解码器的输入顺序是 (c4, c3, c2, c1)，c4是最高层(最小)，c1是最低层(最大)
-        c4, c3, c2, c1 = inputs
-        
-        # --- 特征图处理和上采样 ---
-        b, c, h, w = c4.shape
-        out_c4 = self.linear_c4(c4.reshape(b, c, h*w).permute(0, 2, 1)).permute(0, 2, 1).reshape(b, self.embedding_dim, h, w)
-        out_c4 = self.DySample_C_8(out_c4) # 上采样8倍
-
-        b, c, h, w = c3.shape
-        out_c3 = self.linear_c3(c3.reshape(b, c, h*w).permute(0, 2, 1)).permute(0, 2, 1).reshape(b, self.embedding_dim, h, w)
-        out_c3 = self.DySample_C_4(out_c3) # 上采样4倍
-
-        b, c, h, w = c2.shape
-        out_c2 = self.linear_c2(c2.reshape(b, c, h*w).permute(0, 2, 1)).permute(0, 2, 1).reshape(b, self.embedding_dim, h, w)
-        out_c2 = self.DySample_C_2(out_c2) # 上采样2倍
-
-        b, c, h, w = c1.shape
-        out_c1 = self.linear_c1(c1.reshape(b, c, h*w).permute(0, 2, 1)).permute(0, 2, 1).reshape(b, self.embedding_dim, h, w)
-
-        fused_low_res = torch.cat([out_c4, out_c3, out_c2, out_c1], dim=1)
-        full_res_features = F.interpolate(fused_low_res, size=final_size, mode='bilinear', align_corners=False)
-        out_c = self.GBC_C(full_res_features)
-        out_c = self.linear_fuse(out_c)
-        out_c = self.dropout(out_c)
-        x = self.linear_pred_1(self.linear_pred(out_c))
-        return x
+        return logits
 
 logger = logging.getLogger(__name__)
 
@@ -215,15 +102,11 @@ class SAMbaCrack(nn.Module):
         super().__init__()
 
         # --- 模型超参数定义 ---
-        sam_dims = [96, 192, 384, 768]  # SAM (Hiera) 编码器的原始高维度
-        
-        # **“精准增肥”**: 根据用户要求，加宽 SAVSS 和 HOACM 的通道数，以增加模型容量。
-        # 将模型的可训练参数从约 9.5M 提升至约 15M。
-        savss_dims = [64, 128, 256, 512] # SAVSS (Mamba) 编码器，加宽后的维度
+        sam_dims = [96, 192, 384, 768]
+        savss_dims = [64, 128, 256, 512]
         
         hiera_depths = getattr(args, 'hiera_depths', (2, 2, 6, 2))
         hiera_num_heads = getattr(args, 'hiera_num_heads', (3, 6, 12, 24))
-        mfs_embed_dim = getattr(args, 'mfs_embed_dim', 16)
         savss_drop_path_rate = getattr(args, 'savss_drop_path_rate', 0.1)
         savss_use_rms_norm = getattr(args, 'savss_use_rms_norm', True)
         savss_with_dwconv = getattr(args, 'savss_with_dwconv', True)
@@ -274,16 +157,14 @@ class SAMbaCrack(nn.Module):
             self.mamba_encoder.append(nn.ModuleDict({'block': savss_block, 'downsample': downsample}))
 
         # --- 3. 融合与解码器模块 --- #
-        # **适配**: SAM 适配层现在将 SAM 的高维降到加宽后的 Mamba 维度。
         self.sam_adapters = nn.ModuleList([
             nn.Conv2d(sam_dims[i], savss_dims[i], kernel_size=1) for i in range(4)
         ])
-
-        # **适配**: HOACM 现在在加宽后的维度上进行融合。
         self.hoacms = nn.ModuleList([HOACM(dim=d) for d in savss_dims])
         
-        # **适配**: 解码器现在也需要接收加宽后的维度。
-        self.decoder = MFS(embedding_dim=mfs_embed_dim, in_dims=savss_dims)
+        # **【重构】**: 使用新的 UNetDecoder 替换掉旧的 MFS 解码器。
+        # 这个解码器接收 HOACM 输出的特征维度列表，以构建经典的 U-Net 上采样路径。
+        self.decoder = UNetDecoder(decoder_channels=savss_dims)
 
     def forward(self, x):
         with torch.no_grad():
@@ -312,7 +193,7 @@ class SAMbaCrack(nn.Module):
                 B, C, H, W = mamba_x_2d_down.shape
                 mamba_x_token = mamba_x_2d_down.reshape(B, C, -1).transpose(1, 2)
 
-        projected_features = []
+        fused_features = []
         for i in range(4):
             sam_feat = refined_sam_features[i]
             mamba_feat = mamba_features[i]
@@ -327,9 +208,10 @@ class SAMbaCrack(nn.Module):
             
             sam_feat_adapted = self.sam_adapters[i](sam_feat)
             fused = self.hoacms[i](sam_feat_adapted, mamba_feat)
-            projected_features.append(fused)
+            fused_features.append(fused)
 
-        decoder_input = (projected_features[3], projected_features[2], projected_features[1], projected_features[0])
+        # **【重构】**: 将融合后的特征按 (c4, c3, c2, c1) 顺序送入新的 U-Net 解码器。
+        decoder_input = (fused_features[3], fused_features[2], fused_features[1], fused_features[0])
         logits = self.decoder(decoder_input, final_size=x.shape[-2:])
 
         return logits
