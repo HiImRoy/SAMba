@@ -141,10 +141,10 @@ def save_best_masks(model, device, args, output_dir, best_threshold):
 def get_args_parser():
     parser = argparse.ArgumentParser('SAMBA FOR CRACK', add_help=False)
     parser.add_argument('--model_name', default='SAMbaCrack', type=str)
-    parser.add_argument('--pretrained_weights', type=str, default='sam2_checkpoints/sam2.1_hiera_small.pt', help='Path to the pretrained Hiera weights.')
+    parser.add_argument('--pretrained_weights', type=str, default='sam2_checkpoints/sam2.1_hiera_base_plus.pt', help='Path to the pretrained Hiera weights.')
 
-    parser.add_argument('--BCELoss_ratio', default=0.2, type=float, help="Weight for BCE Loss in the total loss function.")
-    parser.add_argument('--DiceLoss_ratio', default=0.8, type=float, help="Weight for Dice Loss in the total loss function.")
+    parser.add_argument('--BCELoss_ratio', default=0.83, type=float, help="Weight for BCE Loss in the total loss function.")
+    parser.add_argument('--DiceLoss_ratio', default=0.17, type=float, help="Weight for Dice Loss in the total loss function.")
 
     parser.add_argument('--Norm_Type', default='GN', type=str)
     parser.add_argument('--dataset_path', default="data/crack500")
@@ -160,7 +160,7 @@ def get_args_parser():
 
     parser.add_argument('--min_lr', default=1e-6, type=float)
     parser.add_argument('--weight_decay', default=0.01, type=float)
-    parser.add_argument('--epochs', default=200, type=int)
+    parser.add_argument('--epochs', default=100, type=int)
     parser.add_argument('--start_epoch', default=0, type=int)
 
     parser.add_argument('--resume', default='', type=str, help='Path to checkpoint to resume training from.')
