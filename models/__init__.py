@@ -14,19 +14,28 @@ if project_root not in sys.path:
 import torch
 from models.decoder import bce_dice
 from mmcls.SAVSS_dev.models.SAVSS.SAMbaCrack import SAMbaCrack
+from models.unet_baseline import UNetBaseline
 
 def build_model(args):
     """
     Builds the model and criterion based on the provided arguments.
-    This function now correctly instantiates the SAMbaCrack model.
+    This function now supports switching between SAMbaCrack and UNetBaseline.
     """
     device = torch.device(args.device)
-    
-    # 1. Instantiate the correct SAMbaCrack model
-    model = SAMbaCrack(args=args)
-    
-    # 2. The loss function is defined in decoder.py, which we can reuse.
-    criterion = bce_dice(args) 
+    model = None
+
+    # --- Build model based on model_name ---
+    if args.model_name == 'UNetBaseline':
+        model = UNetBaseline(n_channels=3, n_classes=1)
+        # Quick check of parameter count
+        print(f"--- Built UNetBaseline model with ~{sum(p.numel() for p in model.parameters() if p.requires_grad) / 1e6:.2f}M parameters. ---")
+    elif args.model_name == 'SAMbaCrack':
+        model = SAMbaCrack(args=args)
+    else:
+        raise ValueError(f"Model '{args.model_name}' not recognized.")
+
+    # The loss function is defined in decoder.py, which we can reuse.
+    criterion = bce_dice(args)
     criterion.to(device)
 
     return model, criterion

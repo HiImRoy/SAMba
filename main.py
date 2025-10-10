@@ -22,60 +22,83 @@ from eval.evaluate import eval
 from util.logger import get_logger
 # --- RE-ADDED: PolyLR for stable training ---
 from mmengine.optim.scheduler.lr_scheduler import PolyLR
+# --- [NEW] Import for FLOPs calculation ---
+from thop import profile
 
 # --- Helper Functions --- #
 
-def log_parameter_summary(model, log):
-    """Logs a detailed breakdown of model parameters."""
-    log.info("--- Model Parameter Breakdown ---")
+def log_parameter_summary(model, log, args):
+    """Logs a detailed breakdown of model parameters, FLOPs, and size."""
+    log.info("--- Model Summary ---")
 
-    # Overall summary
+    # --- 1. FLOPs Calculation ---
+    try:
+        # Create a dummy input tensor with the correct size and device
+        dummy_input = torch.randn(1, 3, args.load_height, args.load_width).to(next(model.parameters()).device)
+        flops, params = profile(model, inputs=(dummy_input,))
+        log.info(f"FLOPs: {flops / 1e9:.2f} G")
+    except Exception as e:
+        log.warning(f"Could not calculate FLOPs: {e}")
+
+    # --- 2. Parameter Count ---
     total_params = sum(p.numel() for p in model.parameters())
     trainable_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
-
-    log.info(f"Total parameters: {total_params / 1e6:.2f}M")
-    log.info(f"Trainable parameters: {trainable_params / 1e6:.2f}M")
+    log.info(f"Params: {total_params / 1e6:.2f} M")
+    log.info(f"Trainable Params: {trainable_params / 1e6:.2f} M")
     if total_params > 0:
         log.info(f"Trainable Ratio: {trainable_params / total_params * 100:.2f}%")
-    log.info("-----------------------------")
 
-    if hasattr(model, 'savss_patch_embed') and hasattr(model, 'savss_pos_embed'):
-        savss_input_total = sum(p.numel() for p in model.savss_patch_embed.parameters()) + model.savss_pos_embed.numel()
-        savss_input_trainable = sum(p.numel() for p in model.savss_patch_embed.parameters() if p.requires_grad) + (model.savss_pos_embed.numel() if model.savss_pos_embed.requires_grad else 0)
-        
-        trainable_percentage = 0
-        if savss_input_total > 0:
-            trainable_percentage = (savss_input_trainable / savss_input_total) * 100
+    # --- 3. Model Size ---
+    param_size = 0
+    for param in model.parameters():
+        param_size += param.nelement() * param.element_size()
+    buffer_size = 0
+    for buffer in model.buffers():
+        buffer_size += buffer.nelement() * buffer.element_size()
+    model_size_mb = (param_size + buffer_size) / 1024**2
+    log.info(f"Model Size: {model_size_mb:.2f} MB")
+    log.info("---------------------")
 
-        log.info(f"  - SAVSS Input (PatchEmbed + PosEmbed):")
-        log.info(f"    - Total params: {savss_input_total / 1e6:.3f}M")
-        log.info(f"    - Trainable params: {savss_input_trainable / 1e6:.3f}M ({trainable_percentage:.2f}%)")
-
-    module_map = {
-        "SAM Encoder (Frozen)": "sam_encoder",
-        "SAM Refiners": "refiners",
-        "SAM MLP Adapters": "adapters",
-        "SAM Downscale Adapters": "sam_adapters",
-        "SAVSS Encoder (Mamba)": "mamba_encoder",
-        "Fusion (HOACM)": "hoacms",
-        "Decoder": "decoder"
-    }
-
-    for name, attr_name in module_map.items():
-        if hasattr(model, attr_name):
-            module = getattr(model, attr_name)
-            module_total = sum(p.numel() for p in module.parameters())
-            module_trainable = sum(p.numel() for p in module.parameters() if p.requires_grad)
-
+    # --- 4. Detailed Breakdown (for SAMbaCrack) ---
+    if args.model_name == 'SAMbaCrack':
+        log.info("--- Detailed Parameter Breakdown (SAMbaCrack) ---")
+        if hasattr(model, 'savss_patch_embed') and hasattr(model, 'savss_pos_embed'):
+            savss_input_total = sum(p.numel() for p in model.savss_patch_embed.parameters()) + model.savss_pos_embed.numel()
+            savss_input_trainable = sum(p.numel() for p in model.savss_patch_embed.parameters() if p.requires_grad) + (model.savss_pos_embed.numel() if model.savss_pos_embed.requires_grad else 0)
+            
             trainable_percentage = 0
-            if module_total > 0:
-                trainable_percentage = (module_trainable / module_total) * 100
+            if savss_input_total > 0:
+                trainable_percentage = (savss_input_trainable / savss_input_total) * 100
 
-            log.info(f"  - {name}:")
-            log.info(f"    - Total params: {module_total / 1e6:.3f}M")
-            log.info(f"    - Trainable params: {module_trainable / 1e6:.3f}M ({trainable_percentage:.2f}%)")
+            log.info(f"  - SAVSS Input (PatchEmbed + PosEmbed):")
+            log.info(f"    - Total params: {savss_input_total / 1e6:.3f}M")
+            log.info(f"    - Trainable params: {savss_input_trainable / 1e6:.3f}M ({trainable_percentage:.2f}%)")
 
-    log.info("------------------------------------\n")
+        module_map = {
+            "SAM Encoder (Frozen)": "sam_encoder",
+            "SAM Refiners": "refiners",
+            "SAM MLP Adapters": "adapters",
+            "SAM Downscale Adapters": "sam_adapters",
+            "SAVSS Encoder (Mamba)": "mamba_encoder",
+            "Fusion (HOACM)": "hoacms",
+            "Decoder": "decoder"
+        }
+
+        for name, attr_name in module_map.items():
+            if hasattr(model, attr_name):
+                module = getattr(model, attr_name)
+                module_total = sum(p.numel() for p in module.parameters())
+                module_trainable = sum(p.numel() for p in module.parameters() if p.requires_grad)
+
+                trainable_percentage = 0
+                if module_total > 0:
+                    trainable_percentage = (module_trainable / module_total) * 100
+
+                log.info(f"  - {name}:")
+                log.info(f"    - Total params: {module_total / 1e6:.3f}M")
+                log.info(f"    - Trainable params: {module_trainable / 1e6:.3f}M ({trainable_percentage:.2f}%)")
+
+        log.info("----------------------------------------------------\n")
 
 def save_plots(log_df, output_dir):
     """Generates and saves plots for loss and metrics."""
@@ -90,7 +113,6 @@ def save_plots(log_df, output_dir):
     plt.savefig(output_dir / 'loss_curve.png')
     plt.close()
 
-    # --- 【修改】: 在要绘制的指标列表中加入 'Foreground_IoU' ---
     metrics_to_plot = ['mIoU', 'Foreground_IoU', 'ODS', 'OIS', 'F1', 'Precision', 'Recall']
     plt.figure(figsize=(12, 8))
     for metric in metrics_to_plot:
@@ -179,6 +201,7 @@ def get_args_parser():
     return parser
 
 def main(args):
+    # --- [MODIFIED] Simplified output directory and logger setup ---
     if args.resume:
         output_dir = Path(args.resume).parent.parent
         exp_name = output_dir.name
@@ -197,7 +220,13 @@ def main(args):
     masks_dir.mkdir(exist_ok=True)
     plots_dir.mkdir(exist_ok=True)
 
+    # The get_logger function now handles append mode automatically.
     log = get_logger(output_dir, 'experiment_log')
+    
+    # Print resume message if resuming
+    if args.resume:
+        log.info("\n" + "="*20 + " RESUMING TRAINING " + "="*20 + "\n")
+        
     log.info(f"Experiment started: {exp_name}")
     log.info(f"Results will be saved to: {output_dir}")
     log.info("--- Hyperparameters ---")
@@ -218,7 +247,7 @@ def main(args):
         log.info(f"Initializing weights... Will use pretrained weights if path is provided.")
         model.init_weights(args.pretrained_weights)
 
-    log_parameter_summary(model, log)
+    log_parameter_summary(model, log, args)
 
     args.phase = 'train'
     args.batch_size = args.batch_size_train
@@ -226,16 +255,22 @@ def main(args):
     log.info(f'The number of training images = {len(train_dataLoader.dataset)}')
     log.info(f'Number of training batches = {len(train_dataLoader)}')
 
-    finetune_param_ids = set(map(id, model.refiners.parameters())) | set(map(id, model.adapters.parameters()))
-    scratch_params = [p for p in model.parameters() if p.requires_grad and id(p) not in finetune_param_ids]
-    finetune_params = [p for p in model.parameters() if p.requires_grad and id(p) in finetune_param_ids]
+    if args.model_name == 'SAMbaCrack' and hasattr(model, 'refiners'):
+        log.info("Creating optimizer with separate parameter groups for SAMbaCrack (finetuning vs. scratch).")
+        finetune_param_ids = set(map(id, model.refiners.parameters())) | set(map(id, model.adapters.parameters()))
+        scratch_params = [p for p in model.parameters() if p.requires_grad and id(p) not in finetune_param_ids]
+        finetune_params = [p for p in model.parameters() if p.requires_grad and id(p) in finetune_param_ids]
 
-    param_dicts = [
-        {"params": scratch_params, "lr": args.lr},
-        {"params": finetune_params, "lr": args.lr * args.lr_backbone_multiplier},
-    ]
+        param_dicts = [
+            {"params": scratch_params, "lr": args.lr},
+            {"params": finetune_params, "lr": args.lr * args.lr_backbone_multiplier},
+        ]
+        optimizer = torch.optim.AdamW(param_dicts, lr=args.lr, weight_decay=args.weight_decay)
+    else:
+        log.info(f"Creating optimizer with a single parameter group for {args.model_name}.")
+        param_dicts = [{"params": [p for p in model.parameters() if p.requires_grad], "lr": args.lr}]
+        optimizer = torch.optim.AdamW(param_dicts, lr=args.lr, weight_decay=args.weight_decay)
 
-    optimizer = torch.optim.AdamW(param_dicts, lr=args.lr, weight_decay=args.weight_decay)
     lr_scheduler = PolyLR(optimizer, eta_min=args.min_lr, begin=args.start_epoch, end=args.epochs)
 
     if args.resume:
@@ -254,7 +289,18 @@ def main(args):
     start_time = time.time()
     best_mIoU = 0.0
     best_metrics_from_best_mIoU_epoch = {}
-    log_data = []
+    
+    log_csv_path = output_dir / 'training_log.csv'
+    if args.resume and log_csv_path.exists():
+        log.info(f"Loading previous logs from {log_csv_path}")
+        log_df = pd.read_csv(log_csv_path)
+        log_data = log_df.to_dict('records')
+        # --- [MODIFIED] Added check for empty mIoU column to prevent errors ---
+        if 'mIoU' in log_df.columns and not log_df['mIoU'].empty:
+            best_mIoU = log_df['mIoU'].max()
+            log.info(f"Found previous best mIoU: {best_mIoU:.4f}")
+    else:
+        log_data = []
 
     for epoch in range(args.start_epoch, args.epochs):
         epoch_start_time = time.time()
@@ -288,17 +334,16 @@ def main(args):
 
         current_epoch_metrics = eval(log, str(temp_eval_dir), epoch)
 
-        # --- 【修改】: 在终端的 Epoch 总结中打印 Foreground_IoU ---
         print(f"\n" + "-"*25 + f" Epoch {epoch} Summary " + "-"*25)
         print(f"  - Train Loss: {train_stats['loss']:.4f}")
         print(f"  - mIoU:       {current_epoch_metrics.get('mIoU', 0.0):.4f}")
-        print(f"  - Fg IoU:     {current_epoch_metrics.get('Foreground_IoU', 0.0):.4f}") # 新增
+        print(f"  - Fg IoU:     {current_epoch_metrics.get('Foreground_IoU', 0.0):.4f}")
         print(f"  - ODS (F1):   {current_epoch_metrics.get('ODS', 0.0):.4f}")
         print(f"  - OIS (F1):   {current_epoch_metrics.get('OIS', 0.0):.4f}")
         print(f"  - Precision:  {current_epoch_metrics.get('Precision', 0.0):.4f}")
         print(f"  - Recall:     {current_epoch_metrics.get('Recall', 0.0):.4f}")
         print(f"  - Best Thresh:{current_epoch_metrics.get('best_threshold', -1)}")
-        print("-"*70 + f"\n")
+        print("-" * 70 + f"\n")
 
         log.info(f"Epoch {epoch} Validation Metrics: {current_epoch_metrics}")
 
@@ -332,11 +377,10 @@ def main(args):
         best_precision = best_metrics_from_best_mIoU_epoch.get('Precision', 0)
         best_recall = best_metrics_from_best_mIoU_epoch.get('Recall', 0)
 
-        # --- 【修改】: 在最终的总结报告中也加入 Foreground_IoU ---
         final_report = {
             'Best_Epoch': best_metrics_from_best_mIoU_epoch.get('epoch'),
             'mIoU': best_metrics_from_best_mIoU_epoch.get('mIoU'),
-            'Foreground_IoU': best_metrics_from_best_mIoU_epoch.get('Foreground_IoU'), # 新增
+            'Foreground_IoU': best_metrics_from_best_mIoU_epoch.get('Foreground_IoU'),
             'ODS': best_metrics_from_best_mIoU_epoch.get('ODS'),
             'OIS': best_metrics_from_best_mIoU_epoch.get('OIS'),
             'Precision': best_precision,
