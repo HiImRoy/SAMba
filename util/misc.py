@@ -11,45 +11,18 @@ from collections import defaultdict, deque
 import datetime
 import pickle
 from typing import Optional, List
+import io
+import sys
+import contextlib
 
 import torch
 import torch.nn as nn
 import torch.distributed as dist
 from torch import Tensor
+from tqdm import tqdm
 
 # needed due to empty tensor bug in pytorch and torchvision 0.5
 import torchvision
-# if float(torchvision.__version__[:3]) < 0.5:
-#     import math
-#     from torchvision.ops.misc import _NewEmptyTensorOp
-#     def _check_size_scale_factor(dim, size, scale_factor):
-#         # type: (int, Optional[List[int]], Optional[float]) -> None
-#         if size is None and scale_factor is None:
-#             raise ValueError("either size or scale_factor should be defined")
-#         if size is not None and scale_factor is not None:
-#             raise ValueError("only one of size or scale_factor should be defined")
-#         if not (scale_factor is not None and len(scale_factor) != dim):
-#             raise ValueError(
-#                 "scale_factor shape must match input shape. "
-#                 "Input is {}D, scale_factor size is {}".format(dim, len(scale_factor))
-#             )
-#     def _output_size(dim, input, size, scale_factor):
-#         # type: (int, Tensor, Optional[List[int]], Optional[float]) -> List[int]
-#         assert dim == 2
-#         _check_size_scale_factor(dim, size, scale_factor)
-#         if size is not None:
-#             return size
-#         # if dim is not 2 or scale_factor is iterable use _ntuple instead of concat
-#         assert scale_factor is not None and isinstance(scale_factor, (int, float))
-#         scale_factors = [scale_factor, scale_factor]
-#         # math.floor might return float in py2.7
-#         return [
-#             int(math.floor(input.size(i + 2) * scale_factors[i])) for i in range(dim)
-#         ]
-# elif float(torchvision.__version__[:3]) < 0.7:
-#     from torchvision.ops import _new_empty_tensor
-#     from torchvision.ops.misc import _output_size
-
 
 class SmoothedValue(object):
     """Track a series of values and provide access to smoothed values over a
@@ -272,7 +245,6 @@ class MetricLogger(object):
         print('{} Total time: {} ({:.4f} s / it)'.format(
             header, total_time_str, total_time / len(iterable)))
 
-
 def get_sha():
     cwd = os.path.dirname(os.path.abspath(__file__))
 
@@ -291,8 +263,6 @@ def get_sha():
         pass
     message = f"sha: {sha}, status: {diff}, branch: {branch}"
     return message
-
-
 
 
 def _max_by_axis(the_list):
@@ -385,7 +355,6 @@ def init_distributed_mode(args):
         args.rank = proc_id
         args.gpu = proc_id % num_gpus
     else:
-        # print('Not using distributed mode')
         args.distributed = False
         return
 
@@ -420,7 +389,6 @@ def accuracy(output, target, topk=(1,)):
     return res
 
 
-
 def get_total_grad_norm(parameters, norm_type=2):
     parameters = list(filter(lambda p: p.grad is not None, parameters))
     norm_type = float(norm_type)
@@ -435,4 +403,55 @@ def inverse_sigmoid(x, eps=1e-5):
     x2 = (1 - x).clamp(min=eps)
     return torch.log(x1/x2)
 
+# --- 任务1 (最终修复版): 创建一个显存打印的辅助函数 ---
+# 作者: Roy
 
+# 全局变量，用于存储上一个测量点的显存使用量
+last_memory_allocated = 0
+
+def log_gpu_memory(message: str, epoch: int, batch_idx: int):
+    """
+    记录并打印当前 GPU 显存使用情况的增量快照。
+    该函数使用 tqdm.write 来安全地打印，以避免被进度条覆盖，
+    并且只在指定的第一个 epoch 和第一个 batch 执行，以避免刷屏。
+
+    Args:
+        message (str): 在打印显存摘要前显示的自定义消息，用于标记快照点。
+        epoch (int): 当前的 epoch 编号。
+        batch_idx (int): 当前的 batch 编号。
+    """
+    # 只在第一个 epoch 的第一个 batch 进行详细诊断
+    if epoch != 0 or batch_idx != 0:
+        return
+
+    if not torch.cuda.is_available():
+        return
+
+    global last_memory_allocated
+    
+    # 获取当前和峰值的显存使用量（单位：字节）
+    current_memory = torch.cuda.memory_allocated()
+    peak_memory = torch.cuda.max_memory_allocated()
+    
+    # 计算自上一个快照点以来的显存增量
+    delta = current_memory - last_memory_allocated
+    
+    # 将字节转换为更易读的 MiB
+    current_memory_mib = current_memory / 1024**2
+    peak_memory_mib = peak_memory / 1024**2
+    delta_mib = delta / 1024**2
+    
+    # 更新全局变量，为下一次计算做准备
+    last_memory_allocated = current_memory
+
+    # 构造清晰的日志信息
+    log_message = (
+        f"\n--- GPU Memory Log at: {message} ---"
+        f"\n\t  Current Allocated: {current_memory_mib:>8.2f} MiB"
+        f"\n\t     Peak Allocated: {peak_memory_mib:>8.2f} MiB"
+        f"\n\t            Delta: {delta_mib:>+8.2f} MiB"
+        f"\n---------------------------------------------------"
+    )
+    
+    # 使用 tqdm.write 安全地打印日志
+    tqdm.write(log_message)

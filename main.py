@@ -140,7 +140,17 @@ def save_best_masks(model, device, args, output_dir, best_threshold):
 
     with torch.no_grad():
         for data in tqdm(test_dl, desc="Generating best masks"):
-            x, target = data["image"].to(device), data["label"].to(device)
+            # For the new dataset, data is a tuple (image, mask)
+            if isinstance(data, tuple):
+                x, target = data
+                x = x.to(device)
+                target = target.to(device)
+                # The new dataset doesn't provide A_paths, so we need a placeholder name
+                root_name = f"image_{time.time()}"
+            else: # Original dataset structure
+                x, target = data["image"].to(device), data["label"].to(device)
+                root_name = data["A_paths"][0].split("/")[-1]
+
             out = model(x)
 
             label_np = target[0, 0].cpu().numpy()
@@ -161,7 +171,6 @@ def save_best_masks(model, device, args, output_dir, best_threshold):
             cv2.putText(stitched_image, 'Prediction', (label_rgb.shape[1] + 10, 30), cv2.FONT_HERSHEY_SIMPLEX, 1,
                         (0, 0, 255), 2)
 
-            root_name = data["A_paths"][0].split("/")[-1]
             cv2.imwrite(str(output_dir / root_name), stitched_image)
 
 
@@ -177,7 +186,8 @@ def get_args_parser():
                         help="Weight for Dice Loss in the total loss function.")
 
     parser.add_argument('--Norm_Type', default='GN', type=str)
-    parser.add_argument('--dataset_path', default="data/CFD")
+    # [MODIFIED] Changed default dataset path to CrackTree260
+    parser.add_argument('--dataset_path', default="data/CrackTree260")
     parser.add_argument('--batch_size_train', type=int, default=1)
     parser.add_argument('--batch_size_test', type=int, default=1)
 
@@ -192,14 +202,14 @@ def get_args_parser():
 
     parser.add_argument('--min_lr', default=1e-6, type=float)
     parser.add_argument('--weight_decay', default=0.01, type=float)
-    parser.add_argument('--epochs', default=500, type=int)
+    parser.add_argument('--epochs', default=75, type=int)
     parser.add_argument('--start_epoch', default=0, type=int)
 
     parser.add_argument('--resume', default='', type=str, help='Path to checkpoint to resume training from.')
 
     parser.add_argument('--lr_drop', default=30, type=int)
     parser.add_argument('--sgd', action='store_true')
-    parser.add_argument('--output_dir', default='./results', help='Root directory for all outputs')
+    parser.add_argument('--output_dir', default='./results/v1', help='Root directory for all outputs')
     parser.add_argument('--device', default='cuda')
     parser.add_argument('--seed', default=42, type=int)
     parser.add_argument('--dataset_mode', type=str, default='crack')
@@ -335,13 +345,21 @@ def main(args):
         with torch.no_grad():
             model.eval()
             for data in tqdm(test_dl, desc=f"Testing Epoch {epoch}"):
-                x, target = data["image"].to(device), data["label"].cpu().numpy()
+                # [MODIFIED] Handle both old dict-style and new tuple-style data
+                if isinstance(data, tuple):
+                    x, target = data
+                    x = x.to(device)
+                    target = target.cpu().numpy()
+                    root_name = f"image_{time.time()}_e{epoch}" # Placeholder name
+                else: # Original dataset structure
+                    x, target = data["image"].to(device), data["label"].cpu().numpy()
+                    root_name = data["A_paths"][0].split("/")[-1][0:-4]
+
                 out = model(x)
 
                 prob_map_0_1 = torch.sigmoid(out)
 
                 prob_map_uint8 = (prob_map_0_1[0, 0] * 255).cpu().numpy().astype(np.uint8)
-                root_name = data["A_paths"][0].split("/")[-1][0:-4]
                 cv2.imwrite(str(temp_eval_dir / f"{root_name}_pre.png"), prob_map_uint8)
 
                 cv2.imwrite(str(temp_eval_dir / f"{root_name}_lab.png"), (target[0, 0] * 255).astype(np.uint8))

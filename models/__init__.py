@@ -14,8 +14,8 @@ if project_root not in sys.path:
 import torch
 from models.decoder import bce_dice
 
-# [MODIFIED] 导入我们最终组装好的 SAMbaCrackAF 模型
-from mmcls.SAVSS_dev.models.SAVSS.SAMbaCrack import SAMbaCrackAF
+# [FIXED] 导入我们最终组装好的、正确的 SAMbaCrack 模型
+from mmcls.SAVSS_dev.models.SAVSS.SAMbaCrack import SAMbaCrack
 
 # 保留旧的 UNetBaseline 以便进行比较
 from models.unet_baseline import UNetBaseline
@@ -33,10 +33,10 @@ def build_model(args):
         model = UNetBaseline(n_channels=3, n_classes=1)
         print(f"--- 已构建 UNetBaseline 模型，约 {sum(p.numel() for p in model.parameters() if p.requires_grad) / 1e6:.2f}M 参数。 ---")
     
-    # [MODIFIED] 当模型名称为 SAMbaCrack 时，实例化我们全新的、模块化的 SAMbaCrackAF 模型
+    # [FIXED] 当模型名称为 SAMbaCrack 时，实例化我们全新的、模块化的 SAMbaCrack 模型
     elif args.model_name == 'SAMbaCrack':
-        # 注意：现在实例化的类是 SAMbaCrackAF
-        model = SAMbaCrackAF(args=args)
+        # 注意：现在实例化的类是 SAMbaCrack
+        model = SAMbaCrack(args=args)
     
     else:
         raise ValueError(f"无法识别模型 \'{args.model_name}\'。")

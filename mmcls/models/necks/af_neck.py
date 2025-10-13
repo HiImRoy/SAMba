@@ -6,7 +6,8 @@ import torch.nn as nn
 # from ..builder import NECKS
 
 # [FIXED] 使用从项目根目录开始的绝对导入路径，这是最稳健的方式
-from mmcls.SAVSS_dev.models.samba_unet_modules.fusion import AdaptiveFusionModule
+# --- 任务2: 导入新的轻量化模块 ---
+from mmcls.SAVSS_dev.models.samba_unet_modules.fusion import LightAdaptiveFusionModule
 
 
 # @NECKS.register_module() # 暂时注释掉注册器
@@ -16,6 +17,7 @@ class AFNeck(nn.Module): # 暂时继承自 nn.Module
 
     该模块作为一个颈部组件，接收来自两个不同主干网络 (Backbone)
     的多尺度特征金字塔，并在每个尺度上对它们进行自适应融合。
+    作者: Roy
     """
 
     def __init__(self, in_channels_list, init_cfg=None):
@@ -33,11 +35,12 @@ class AFNeck(nn.Module): # 暂时继承自 nn.Module
         assert isinstance(in_channels_list, list) and len(in_channels_list) == 4, \
             f"in_channels_list 必须是一个包含4个整数的列表，但得到的是: {in_channels_list}"
 
-        # 创建一个模块列表，其中包含4个并行的自适应融合模块
+        # --- 任务2: 使用新的轻量化模块 ---
+        # 创建一个模块列表，其中包含4个并行的轻量化自适应融合模块
         self.fusion_modules = nn.ModuleList()
         for in_channels in in_channels_list:
             self.fusion_modules.append(
-                AdaptiveFusionModule(in_channels=in_channels)
+                LightAdaptiveFusionModule(in_channels=in_channels)
             )
 
     def forward(self, feats_sam, feats_mamba):
