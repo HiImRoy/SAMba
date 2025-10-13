@@ -199,14 +199,14 @@ def get_args_parser():
 
     parser.add_argument('--min_lr', default=1e-6, type=float)
     parser.add_argument('--weight_decay', default=0.01, type=float)
-    parser.add_argument('--epochs', default=75, type=int)
+    parser.add_argument('--epochs', default=300, type=int)
     parser.add_argument('--start_epoch', default=0, type=int)
 
     parser.add_argument('--resume', default='', type=str, help='Path to checkpoint to resume training from.')
 
     parser.add_argument('--lr_drop', default=30, type=int)
     parser.add_argument('--sgd', action='store_true')
-    parser.add_argument('--output_dir', default='./results/v1', help='Root directory for all outputs')
+    parser.add_argument('--output_dir', default='./results/FPN', help='Root directory for all outputs')
     parser.add_argument('--device', default='cuda')
     parser.add_argument('--seed', default=42, type=int)
     parser.add_argument('--dataset_mode', type=str, default='crack')

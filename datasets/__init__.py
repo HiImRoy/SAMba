@@ -15,8 +15,11 @@ import torch.utils.data
 import os
 import glob
 import random
+import cv2
+import numpy as np
 import albumentations as A
 from albumentations.pytorch import ToTensorV2
+from tqdm import tqdm
 
 from datasets.base_dataset import BaseDataset
 from datasets.crack_tree_dataset import crack_tree_dataset
@@ -46,11 +49,7 @@ def get_option_setter(dataset_name):
 
 
 def create_dataset(args):
-    """Create a dataset given the option.
-
-    This function wraps the class CustomDatasetDataLoader.
-        This is the main interface between this package and 'train.py'/'test.py'
-    """
+    """Create a dataset given the option."""
     data_loader = CustomDatasetDataLoader(args)
     dataset = data_loader.load_data()
     return dataset
@@ -60,29 +59,19 @@ class CustomDatasetDataLoader():
     """Wrapper class of Dataset class that performs multi-threaded data loading"""
 
     def __init__(self, args):
-        """Initialize this class
-
-        Step 1: create a dataset instance given the name [dataset_mode]
-        Step 2: create a multi-threaded data loader.
-        """
+        """Initialize this class"""
         self.args = args
 
         if 'CrackTree260' in args.dataset_path:
             img_dir = os.path.join(args.dataset_path, 'img')
             lab_dir = os.path.join(args.dataset_path, 'lab')
+            all_image_files = sorted([os.path.join(img_dir, f) for f in os.listdir(img_dir) if f.lower().endswith('.jpg')])
+            all_mask_files = sorted([os.path.join(lab_dir, f) for f in os.listdir(lab_dir) if f.lower().endswith('.bmp')])
 
-            all_image_paths = sorted([os.path.join(img_dir, f) for f in os.listdir(img_dir) if f.lower().endswith('.jpg')])
-            all_mask_paths = sorted([os.path.join(lab_dir, f) for f in os.listdir(lab_dir) if f.lower().endswith('.bmp')])
+            if len(all_image_files) != len(all_mask_files):
+                raise ValueError(f"图像和掩码文件的数量不匹配 (图像: {len(all_image_files)} vs 掩码: {len(all_mask_files)})。")
 
-            if not all_image_paths:
-                raise FileNotFoundError(f"数据集错误：在路径 {img_dir} 中没有找到任何 .jpg/.JPG 图像文件。")
-            if not all_mask_paths:
-                raise FileNotFoundError(f"数据集错误：在路径 {lab_dir} 中没有找到任何 .bmp/.BMP 掩码文件。")
-            
-            if len(all_image_paths) != len(all_mask_paths):
-                raise ValueError(f"图像和掩码文件的数量不匹配 (图像: {len(all_image_paths)} vs 掩码: {len(all_mask_paths)})。请检查您的数据集文件夹。")
-
-            indices = list(range(len(all_image_paths)))
+            indices = list(range(len(all_image_files)))
             random.Random(args.seed).shuffle(indices)
             
             split_ratio = 0.8
@@ -93,6 +82,7 @@ class CustomDatasetDataLoader():
 
             if args.phase == 'train':
                 selected_indices = train_indices
+                # --- [FIXED] Use RandomCrop for training ---
                 transform = A.Compose([
                     A.RandomCrop(height=args.load_height, width=args.load_width, always_apply=True),
                     A.HorizontalFlip(p=0.5),
@@ -100,22 +90,28 @@ class CustomDatasetDataLoader():
                     A.Normalize(mean=(0.485, 0.456, 0.406), std=(0.229, 0.224, 0.225)),
                     ToTensorV2(),
                 ])
-            else:
+            else: # 'test' phase for validation
                 selected_indices = val_indices
                 transform = A.Compose([
+                    A.CenterCrop(height=args.load_height, width=args.load_width, always_apply=True),
                     A.Normalize(mean=(0.485, 0.456, 0.406), std=(0.229, 0.224, 0.225)),
                     ToTensorV2(),
                 ])
 
-            image_paths = [all_image_paths[i] for i in selected_indices]
-            mask_paths = [all_mask_paths[i] for i in selected_indices]
+            image_paths = [all_image_files[i] for i in selected_indices]
+            mask_paths = [all_mask_files[i] for i in selected_indices]
 
-            if not image_paths and args.phase == 'val':
+            if not image_paths and args.phase == 'test':
                  print("警告：验证集为空。这可能是因为数据集太小或划分比例不合适。")
             elif not image_paths:
                  raise ValueError(f"错误：在为 '{args.phase}' 阶段划分数据集后，没有剩余的样本。")
 
-            self.dataset = crack_tree_dataset(image_paths=image_paths, mask_paths=mask_paths, transform=transform)
+            # --- [FIXED] Removed unexpected keyword arguments ---
+            self.dataset = crack_tree_dataset(
+                image_paths=image_paths, 
+                mask_paths=mask_paths, 
+                transform=transform
+            )
             
             self.dataloader = torch.utils.data.DataLoader(
                 self.dataset,
@@ -139,10 +135,8 @@ class CustomDatasetDataLoader():
         return self
 
     def __len__(self):
-        """Return the number of batches in the dataset"""
         return len(self.dataloader)
 
     def __iter__(self):
-        """Return a batch of data"""
         for i, data in enumerate(self.dataloader):
             yield data
