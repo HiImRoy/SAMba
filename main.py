@@ -141,15 +141,22 @@ def save_best_masks(model, device, args, output_dir, best_threshold):
     with torch.no_grad():
         for i, data in enumerate(tqdm(test_dl, desc="Generating best masks")):
             if isinstance(data, (list, tuple)):
-                x, target = data
+                if len(data) == 3:
+                    x, target, path = data
+                    root_name = os.path.basename(path[0]).split('.')[0]
+                else:
+                    x, target = data
+                    root_name = f"best_mask_{i}"
                 x = x.to(device)
                 target = target.to(device)
-                root_name = f"best_mask_{i}.png"
             else: # Original dataset structure
                 x, target = data["image"].to(device), data["label"].to(device)
                 root_name = data["A_paths"][0].split("/")[-1]
 
             out = model(x)
+
+            if target.dim() == 3:
+                target = target.unsqueeze(1)
 
             label_np = target[0, 0].cpu().numpy()
 
@@ -169,7 +176,7 @@ def save_best_masks(model, device, args, output_dir, best_threshold):
             cv2.putText(stitched_image, 'Prediction', (label_rgb.shape[1] + 10, 30), cv2.FONT_HERSHEY_SIMPLEX, 1,
                         (0, 0, 255), 2)
 
-            cv2.imwrite(str(output_dir / root_name), stitched_image)
+            cv2.imwrite(str(output_dir / f"{root_name}.png"), stitched_image)
 
 
 def get_args_parser():
@@ -335,28 +342,31 @@ def main(args):
         test_dl = create_dataset(args)
         with torch.no_grad():
             model.eval()
-            # --- [FIXED] Added enumerate and logic to handle both data formats ---
+            # --- [FIXED] Final fix for validation loop to handle all data formats and save correctly ---
             for i, data in enumerate(tqdm(test_dl, desc=f"Testing Epoch {epoch}")):
                 if isinstance(data, (list, tuple)):
-                    x, target = data
+                    if len(data) == 3:
+                        x, target_tensor, path = data
+                        root_name = os.path.basename(path[0]).split('.')[0]
+                    else:
+                        x, target_tensor = data
+                        root_name = f"val_image_{i}"
                     x = x.to(device)
-                    target = target.cpu().numpy()
-                    root_name = f"val_image_{i}" # Placeholder name for new dataset
+                    target_np = target_tensor.cpu().numpy()
+                    # [FIXED] Correctly get the 2D mask and ensure it's uint8 [0, 255]
+                    target_to_save = target_np[0].astype(np.uint8)
                 else:
                     x = data["image"].to(device)
-                    target = data["label"].cpu().numpy()
+                    target_np = data["label"].cpu().numpy()
                     root_name = data["A_paths"][0].split("/")[-1][0:-4]
+                    target_to_save = (target_np[0, 0] * 255).astype(np.uint8)
 
                 out = model(x)
-
                 prob_map_0_1 = torch.sigmoid(out)
-
                 prob_map_uint8 = (prob_map_0_1[0, 0] * 255).cpu().numpy().astype(np.uint8)
+                
+                # Save prediction and label with the correct names for eval.py
                 cv2.imwrite(str(temp_eval_dir / f"{root_name}_pre.png"), prob_map_uint8)
-
-                # Ensure target is also binary (0 or 255) for saving
-                # The new dataset loader returns float masks, so we need to handle it.
-                target_to_save = (target[0, 0] * 255).astype(np.uint8) if target.dtype == np.float32 else target[0, 0]
                 cv2.imwrite(str(temp_eval_dir / f"{root_name}_lab.png"), target_to_save)
 
         current_epoch_metrics = eval(log, str(temp_eval_dir), epoch)
