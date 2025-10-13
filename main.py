@@ -139,14 +139,12 @@ def save_best_masks(model, device, args, output_dir, best_threshold):
     float_threshold = best_threshold / 255.0
 
     with torch.no_grad():
-        for data in tqdm(test_dl, desc="Generating best masks"):
-            # For the new dataset, data is a tuple (image, mask)
-            if isinstance(data, tuple):
+        for i, data in enumerate(tqdm(test_dl, desc="Generating best masks")):
+            if isinstance(data, (list, tuple)):
                 x, target = data
                 x = x.to(device)
                 target = target.to(device)
-                # The new dataset doesn't provide A_paths, so we need a placeholder name
-                root_name = f"image_{time.time()}"
+                root_name = f"best_mask_{i}.png"
             else: # Original dataset structure
                 x, target = data["image"].to(device), data["label"].to(device)
                 root_name = data["A_paths"][0].split("/")[-1]
@@ -186,7 +184,6 @@ def get_args_parser():
                         help="Weight for Dice Loss in the total loss function.")
 
     parser.add_argument('--Norm_Type', default='GN', type=str)
-    # [MODIFIED] Changed default dataset path to CrackTree260
     parser.add_argument('--dataset_path', default="data/CrackTree260")
     parser.add_argument('--batch_size_train', type=int, default=1)
     parser.add_argument('--batch_size_test', type=int, default=1)
@@ -222,7 +219,6 @@ def get_args_parser():
 
 
 def main(args):
-    # --- [MODIFIED] Simplified output directory and logger setup ---
     if args.resume:
         output_dir = Path(args.resume).parent.parent
         exp_name = output_dir.name
@@ -274,17 +270,12 @@ def main(args):
     log.info(f'The number of training images = {len(train_dataLoader.dataset)}')
     log.info(f'Number of training batches = {len(train_dataLoader)}')
 
-    # [FIXED] Optimizer setup for the new modular SAMbaCrack-AF model
     if args.model_name == 'SAMbaCrack' and hasattr(model, 'backbone'):
         log.info("Creating optimizer with separate LRs for SAMbaCrack-AF (finetuning vs. scratch).")
-        # refiners 和 adapters 在 backbone 中，我们希望用较小的学习率微调它们
         finetune_param_ids = set(map(id, model.backbone.refiners.parameters())) | set(
             map(id, model.backbone.adapters.parameters()))
-
-        # 其他所有可训练的参数都属于从头训练的部分
         scratch_params = [p for p in model.parameters() if p.requires_grad and id(p) not in finetune_param_ids]
         finetune_params = [p for p in model.parameters() if p.requires_grad and id(p) in finetune_param_ids]
-
         param_dicts = [
             {"params": scratch_params, "lr": args.lr},
             {"params": finetune_params, "lr": args.lr * args.lr_backbone_multiplier},
@@ -344,15 +335,16 @@ def main(args):
         test_dl = create_dataset(args)
         with torch.no_grad():
             model.eval()
-            for data in tqdm(test_dl, desc=f"Testing Epoch {epoch}"):
-                # [MODIFIED] Handle both old dict-style and new tuple-style data
-                if isinstance(data, tuple):
+            # --- [FIXED] Added enumerate and logic to handle both data formats ---
+            for i, data in enumerate(tqdm(test_dl, desc=f"Testing Epoch {epoch}")):
+                if isinstance(data, (list, tuple)):
                     x, target = data
                     x = x.to(device)
                     target = target.cpu().numpy()
-                    root_name = f"image_{time.time()}_e{epoch}" # Placeholder name
-                else: # Original dataset structure
-                    x, target = data["image"].to(device), data["label"].cpu().numpy()
+                    root_name = f"val_image_{i}" # Placeholder name for new dataset
+                else:
+                    x = data["image"].to(device)
+                    target = data["label"].cpu().numpy()
                     root_name = data["A_paths"][0].split("/")[-1][0:-4]
 
                 out = model(x)
@@ -362,7 +354,10 @@ def main(args):
                 prob_map_uint8 = (prob_map_0_1[0, 0] * 255).cpu().numpy().astype(np.uint8)
                 cv2.imwrite(str(temp_eval_dir / f"{root_name}_pre.png"), prob_map_uint8)
 
-                cv2.imwrite(str(temp_eval_dir / f"{root_name}_lab.png"), (target[0, 0] * 255).astype(np.uint8))
+                # Ensure target is also binary (0 or 255) for saving
+                # The new dataset loader returns float masks, so we need to handle it.
+                target_to_save = (target[0, 0] * 255).astype(np.uint8) if target.dtype == np.float32 else target[0, 0]
+                cv2.imwrite(str(temp_eval_dir / f"{root_name}_lab.png"), target_to_save)
 
         current_epoch_metrics = eval(log, str(temp_eval_dir), epoch)
 
