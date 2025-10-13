@@ -177,9 +177,9 @@ def get_args_parser():
                         help="Weight for Dice Loss in the total loss function.")
 
     parser.add_argument('--Norm_Type', default='GN', type=str)
-    parser.add_argument('--dataset_path', default="data/CFD")
-    parser.add_argument('--batch_size_train', type=int, default=1)
-    parser.add_argument('--batch_size_test', type=int, default=1)
+    parser.add_argument('--dataset_path', default="data/crack500")
+    parser.add_argument('--batch_size_train', type=int, default=4)
+    parser.add_argument('--batch_size_test', type=int, default=4)
 
     parser.add_argument('--lr_scheduler', type=str, default='PolyLR', help='LR scheduler to use.')
     parser.add_argument('--lr', default=1e-4, type=float, help="The initial learning rate for PolyLR.")
@@ -192,7 +192,7 @@ def get_args_parser():
 
     parser.add_argument('--min_lr', default=1e-6, type=float)
     parser.add_argument('--weight_decay', default=0.01, type=float)
-    parser.add_argument('--epochs', default=500, type=int)
+    parser.add_argument('--epochs', default=100, type=int)
     parser.add_argument('--start_epoch', default=0, type=int)
 
     parser.add_argument('--resume', default='', type=str, help='Path to checkpoint to resume training from.')

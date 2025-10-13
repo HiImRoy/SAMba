@@ -1,76 +1,64 @@
 # Copyright (c) Roy. All rights reserved.
-#
-# This source code is licensed under the license found in the
-# LICENSE file in the root directory of this source tree.
 
 import torch.nn as nn
 
 class BottConv(nn.Module):
-    """瓶颈卷积 (Bottleneck Convolution)。
+    """瓶颈卷积块 (Bottleneck Convolution Block)。
     
-    这是一个经典的 MobileNet 风格的瓶颈块，包含 1x1 降维、深度可分离卷积和 1x1 升维。
+    一个高效的卷积模块，通过 1x1 -> 3x3 -> 1x1 的卷积序列来替代单一的
+    大核卷积，以减少参数量和计算成本，同时保持相似的感受野。
     """
-    def __init__(self, in_channels, out_channels, mid_channels, kernel_size, stride=1, padding=0, bias=True):
+    def __init__(self, in_channels, out_channels, mid_channels, kernel_size, padding, stride):
         super(BottConv, self).__init__()
-        # 1x1 卷积: 降维 (瓶颈)
-        self.pointwise_1 = nn.Conv2d(in_channels, mid_channels, 1, bias=bias)
-        # 深度可分离卷积
-        self.depthwise = nn.Conv2d(mid_channels, mid_channels, kernel_size, stride, padding, groups=mid_channels, bias=False)
-        # 1x1 卷积: 升维
-        self.pointwise_2 = nn.Conv2d(mid_channels, out_channels, 1, bias=False)
+        self.bott_conv = nn.Sequential(
+            # 1x1 卷积，用于降维 (squeeze)
+            nn.Conv2d(in_channels, mid_channels, kernel_size=1, stride=1, padding=0, bias=False),
+            nn.BatchNorm2d(mid_channels),
+            nn.ReLU(inplace=True),
+            # 3x3 卷积，用于特征提取
+            nn.Conv2d(mid_channels, mid_channels, kernel_size=kernel_size, stride=stride, padding=padding, bias=False),
+            nn.BatchNorm2d(mid_channels),
+            nn.ReLU(inplace=True),
+            # 1x1 卷积，用于升维 (expand)
+            nn.Conv2d(mid_channels, out_channels, kernel_size=1, stride=1, padding=0, bias=False),
+            nn.BatchNorm2d(out_channels),
+            nn.ReLU(inplace=True),
+        )
 
     def forward(self, x):
-        x = self.pointwise_1(x)
-        x = self.depthwise(x)
-        x = self.pointwise_2(x)
-        return x
-
-def get_norm_layer(norm_type, channels, num_groups):
-    """根据类型获取归一化层。"""
-    if norm_type == 'GN':
-        return nn.GroupNorm(num_groups=num_groups, num_channels=channels)
-    else:
-        # 注意：原始代码为 InstanceNorm3d，对于2D图像通常应为 InstanceNorm2d
-        return nn.InstanceNorm2d(channels)
+        return self.bott_conv(x)
 
 class GBC(nn.Module):
-    """全局瓶颈卷积块 (Global Bottleneck Convolution) 的原始实现。"""
-    def __init__(self, in_channels, norm_type='GN'):
+    """全局瓶颈卷积块 (Global Bottleneck Convolution Block)。
+    
+    在 BottConv 的基础上增加了残差连接，形成一个更强大的特征提取单元。
+    残差连接要求输入和输出的通道数必须相同。
+    """
+    def __init__(self, in_channels, out_channels=None, intermediate_channels=None, norm_type=None):
         super(GBC, self).__init__()
+        self.in_channels = in_channels
+        # 如果未指定输出通道，则默认为输入通道，以满足残差连接的要求
+        self.out_channels = out_channels if out_channels is not None else in_channels
+        self.intermediate_channels = intermediate_channels if intermediate_channels is not None else in_channels // 4
 
-        # 定义四个不同的处理块
-        self.block1 = nn.Sequential(
-            BottConv(in_channels, in_channels, in_channels // 8, 3, 1, 1),
-            get_norm_layer(norm_type, in_channels, in_channels // 16),
-            nn.ReLU()
-        )
-
-        self.block2 = nn.Sequential(
-            BottConv(in_channels, in_channels, in_channels // 8, 3, 1, 1),
-            get_norm_layer(norm_type, in_channels, in_channels // 16),
-            nn.ReLU()
-        )
-
-        self.block3 = nn.Sequential(
-            BottConv(in_channels, in_channels, in_channels // 8, 1, 1, 0),
-            get_norm_layer(norm_type, in_channels, in_channels // 16),
-            nn.ReLU()
-        )
-
-        self.block4 = nn.Sequential(
-            BottConv(in_channels, in_channels, in_channels // 8, 1, 1, 0),
-            get_norm_layer(norm_type, in_channels, 16),
-            nn.ReLU()
-        )
+        # 核心卷积组件
+        self.gwc = BottConv(self.in_channels, self.out_channels, self.intermediate_channels, 3, 1, 1)
+        
+        # 归一化层
+        if norm_type == 'IN':
+            self.norm = nn.InstanceNorm2d(self.out_channels)
+        else:
+            self.norm = nn.BatchNorm2d(self.out_channels)
+        
+        # 激活函数
+        self.act = nn.GELU()
 
     def forward(self, x):
-        residual = x # 保存残差连接
-
-        # 复杂的特征交互路径
-        x1 = self.block1(x)
-        x1 = self.block2(x1)
-        x2 = self.block3(x)
-        x = x1 * x2 # 两个分支的特征进行逐元素相乘
-        x = self.block4(x)
-
-        return x + residual # 添加残差连接
+        # 保存输入用于残差连接
+        res = x
+        # 通过瓶颈卷积
+        x = self.gwc(x)
+        # 归一化和激活
+        x = self.act(self.norm(x))
+        # 添加残差连接
+        return x + res

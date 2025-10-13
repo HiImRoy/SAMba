@@ -6,92 +6,86 @@
 import torch.nn as nn
 import torch
 import torch.nn.functional as F
-from models.GBC import GBC, BottConv
+from models.GBC import GBC
 from models.DySample import DySample
 
 class MLP(nn.Module):
-    """简单的多层感知机，用于特征维度映射。"""
-    def __init__(self, input_dim=2048, embed_dim=768):
+    """简单的1x1卷积，用于特征维度映射。"""
+    def __init__(self, input_dim, embed_dim):
         super().__init__()
-        self.proj = nn.Linear(input_dim, embed_dim)
+        self.proj = nn.Conv2d(input_dim, embed_dim, kernel_size=1, stride=1, padding=0)
 
     def forward(self, x):
         x = self.proj(x)
         return x
 
-class MFS(nn.Module):
-    """多尺度特征分割头 (Multi-scale Feature Segmentation Head)。
-    
-    该模块作为解码器，接收来自编码器不同层级的特征图，
-    并将它们融合以生成最终的分割结果。
+class MFSHead(nn.Module):
     """
-    def __init__(self, embedding_dim):  # 在我们的模型中 embedding_dim=8
-        super(MFS, self).__init__()
+    全分辨率多尺度特征分割头 (Full-Resolution Multi-scale Feature Segmentation Head).
+    该模块将来自颈部的多尺度特征图并行上采样至全分辨率，然后进行深度融合，
+    最终直接输出全分辨率的分割预测图。
+    """
+    def __init__(self, in_channels=[96, 192, 384, 768], embedding_dim=8, dropout_ratio=0.1):
+        super(MFSHead, self).__init__()
 
+        self.in_channels = in_channels
         self.embedding_dim = embedding_dim
-        # 定义 MLP 层，将不同通道数的输入特征图统一到 embedding_dim
-        # c4: 最高层特征 (来自 SAMbaCrack 的 projections[3]), 通道 128 -> embedding_dim
-        # c3: ... (来自 projections[2]), 通道 64 -> embedding_dim
-        # c2: ... (来自 projections[1]), 通道 32 -> embedding_dim
-        # c1: 最低层特征 (来自 projections[0]), 通道 16 -> embedding_dim
-        self.linear_c4 = MLP(input_dim=128, embed_dim=embedding_dim)
-        self.linear_c3 = MLP(input_dim=64, embed_dim=embedding_dim)
-        self.linear_c2 = MLP(input_dim=32, embed_dim=embedding_dim)
-        self.linear_c1 = MLP(input_dim=16, embed_dim=embedding_dim)
+
+        # A. 并行通道对齐 (MLPs)
+        # 使用独立的 1x1 Conv 将不同通道数的输入特征图统一到 embedding_dim
+        self.c1_mlp = MLP(input_dim=self.in_channels[0], embed_dim=self.embedding_dim)
+        self.c2_mlp = MLP(input_dim=self.in_channels[1], embed_dim=self.embedding_dim)
+        self.c3_mlp = MLP(input_dim=self.in_channels[2], embed_dim=self.embedding_dim)
+        self.c4_mlp = MLP(input_dim=self.in_channels[3], embed_dim=self.embedding_dim)
+
+        # B. 并行空间对齐 (上采样至全分辨率)
+        # c1 (112x112) -> 448x448 (x4)
+        # c2 (56x56)   -> 448x448 (x8)
+        # c3 (28x28)   -> 448x448 (x16)
+        # c4 (14x14)   -> 448x448 (x32)
+        self.upsample_c1 = DySample(self.embedding_dim, scale=4)
+        self.upsample_c2 = DySample(self.embedding_dim, scale=8)
+        self.upsample_c3 = DySample(self.embedding_dim, scale=16)
+        self.upsample_c4 = DySample(self.embedding_dim, scale=32)
+
+        # D. 全分辨率深度融合
+        self.fusion_gbc = GBC(in_channels=self.embedding_dim * 4)
+        self.fusion_conv = nn.Conv2d(self.embedding_dim * 4, self.embedding_dim, kernel_size=1, bias=False)
         
-        # 用于处理拼接后特征的 GBC 模块
-        self.GBC_C = GBC(embedding_dim*4) # 8*4=32
-        self.GBC_8 = GBC(8, norm_type='IN')
-        self.GN_C = nn.GroupNorm(num_channels=embedding_dim*4, num_groups=embedding_dim*4//16)
-        # 用于融合后降维的瓶颈卷积
-        self.linear_fuse = BottConv(embedding_dim*4, embedding_dim, embedding_dim//8, kernel_size=1, padding=0, stride=1)
+        # E. 全分辨率预测
+        self.dropout = nn.Dropout2d(dropout_ratio) if dropout_ratio > 0. else nn.Identity()
+        self.final_conv = nn.Conv2d(self.embedding_dim, 1, kernel_size=1)
 
-        # 最终的预测层
-        self.linear_pred = BottConv(embedding_dim, 1, 1, kernel_size=1)
-        self.linear_pred_1 = nn.Conv2d(1, 1, kernel_size=1)
-        self.dropout = nn.Dropout(p=0.1)
-
-        # 动态上采样模块，用于统一特征图的空间分辨率
-        self.DySample_C_2 = DySample(embedding_dim, scale=2)
-        self.DySample_C_4 = DySample(embedding_dim, scale=4)
-        self.DySample_C_8 = DySample(embedding_dim, scale=8)
 
     def forward(self, inputs):
-        # inputs 是一个包含 c4, c3, c2, c1 的元组
-        c4, c3, c2, c1 = inputs
-        
-        # --- 处理 c4 (最高层) ---
-        b, c, h, w = c4.shape
-        # 维度映射: (B, C, H, W) -> (B, H*W, C) -> (B, H*W, E) -> (B, E, H, W)
-        out_c4 = self.linear_c4(c4.reshape(b, c, h*w).permute(0, 2, 1)).permute(0, 2, 1).reshape(b, self.embedding_dim, h, w)
-        out_c4 = self.DySample_C_8(out_c4) # 上采样 8 倍
+        # inputs: (c1, c2, c3, c4)
+        # c1: (B, 96, 112, 112)
+        # c2: (B, 192, 56, 56)
+        # c3: (B, 384, 28, 28)
+        # c4: (B, 768, 14, 14)
+        c1, c2, c3, c4 = inputs
 
-        # --- 处理 c3 ---
-        b, c, h, w = c3.shape
-        out_c3 = self.linear_c3(c3.reshape(b, c, h*w).permute(0, 2, 1)).permute(0, 2, 1).reshape(b, self.embedding_dim, h, w)
-        out_c3 = self.DySample_C_4(out_c3) # 上采样 4 倍
+        # A. 并行通道对齐
+        c1_p = self.c1_mlp(c1)
+        c2_p = self.c2_mlp(c2)
+        c3_p = self.c3_mlp(c3)
+        c4_p = self.c4_mlp(c4)
 
-        # --- 处理 c2 ---
-        b, c, h, w = c2.shape
-        out_c2 = self.linear_c2(c2.reshape(b, c, h*w).permute(0, 2, 1)).permute(0, 2, 1).reshape(b, self.embedding_dim, h, w)
-        out_c2 = self.DySample_C_2(out_c2) # 上采样 2 倍
+        # B. 并行空间对齐
+        upsample_c1 = self.upsample_c1(c1_p)
+        upsample_c2 = self.upsample_c2(c2_p)
+        upsample_c3 = self.upsample_c3(c3_p)
+        upsample_c4 = self.upsample_c4(c4_p)
 
-        # --- 处理 c1 (最低层) ---
-        b, c, h, w = c1.shape
-        out_c1 = self.linear_c1(c1.reshape(b, c, h*w).permute(0, 2, 1)).permute(0, 2, 1).reshape(b, self.embedding_dim, h, w)
+        # C. 全分辨率拼接
+        fused_feats = torch.cat([upsample_c1, upsample_c2, upsample_c3, upsample_c4], dim=1)
 
-        # --- 融合 ---
-        # 沿通道维度拼接所有处理后的特征图
-        out_c = self.GBC_C(torch.cat([out_c4, out_c3, out_c2, out_c1], dim=1))
-        # 使用 1x1 卷积进行特征融合和降维
-        out_c = self.linear_fuse(out_c)
+        # D. 全分辨率深度融合
+        fused_feats = self.fusion_gbc(fused_feats)
+        fused_feats = self.fusion_conv(fused_feats)
 
-        # --- 生成预测 ---
-        out_c = self.dropout(out_c)
-        x = self.linear_pred_1(self.linear_pred(out_c))
+        # E. 全分辨率预测
+        fused_feats = self.dropout(fused_feats)
+        logits = self.final_conv(fused_feats)
 
-        # 将最终输出上采样到与最大特征图 (c1) 相同的尺寸
-        _, _, H, W = c1.shape
-        x = F.interpolate(x, size=(H, W), mode='bilinear', align_corners=False)
-
-        return x
+        return logits

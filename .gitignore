@@ -18,3 +18,4 @@ checkpoint_TUT/*
 /data/
 /results/
 /sam2_checkpoints/
+/profiler_logs/

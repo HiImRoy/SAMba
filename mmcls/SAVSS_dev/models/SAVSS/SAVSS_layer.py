@@ -13,75 +13,11 @@ from mmcv.cnn.utils.weight_init import trunc_normal_
 from mamba_ssm.ops.selective_scan_interface import selective_scan_fn
 from mamba_ssm.ops.triton.layernorm import RMSNorm
 
-# --- 内联 GBC.py 内容以解决循环导入问题 ---
-class BottConv(nn.Module):
-    """瓶颈卷积块。"""
-    def __init__(self, in_channels, out_channels, mid_channels, kernel_size, padding, stride):
-        super(BottConv, self).__init__()
-        self.bott_conv = nn.Sequential(
-            nn.Conv2d(in_channels, mid_channels, kernel_size=1, stride=1, padding=0, bias=False),
-            nn.BatchNorm2d(mid_channels),
-            nn.ReLU(inplace=True),
-            nn.Conv2d(mid_channels, mid_channels, kernel_size=kernel_size, stride=stride, padding=padding, bias=False),
-            nn.BatchNorm2d(mid_channels),
-            nn.ReLU(inplace=True),
-            nn.Conv2d(mid_channels, out_channels, kernel_size=1, stride=1, padding=0, bias=False),
-            nn.BatchNorm2d(out_channels),
-            nn.ReLU(inplace=True),
-        )
+# 使用从项目根目录开始的绝对导入路径，这是最稳健的方式
+from models.GBC import GBC, BottConv
+from models.PAF import PAF
 
-    def forward(self, x):
-        return self.bott_conv(x)
 
-class GBC(nn.Module):
-    """全局瓶颈卷积块。"""
-    def __init__(self, in_channels, out_channels=None, intermediate_channels=None, norm_type=None):
-        super(GBC, self).__init__()
-        self.in_channels = in_channels
-        self.out_channels = out_channels if out_channels is not None else in_channels
-        self.intermediate_channels = intermediate_channels if intermediate_channels is not None else in_channels // 4
-
-        self.gwc = BottConv(self.in_channels, self.out_channels, self.intermediate_channels, 3, 1, 1)
-        if norm_type == 'IN':
-            self.norm = nn.InstanceNorm2d(self.out_channels)
-        else:
-            self.norm = nn.BatchNorm2d(self.out_channels)
-        self.act = nn.GELU()
-
-    def forward(self, x):
-        res = x
-        x = self.gwc(x)
-        x = self.act(self.norm(x))
-        return x + res
-
-# --- 内联 PAF.py 内容并修复维度问题 ---
-class PAF(nn.Module):
-    """金字塔注意力融合模块 (Pyramid Attention Fusion)。"""
-    def __init__(self, in_channels, hidden_dim, kernel_size=3, padding=1, stride=1):
-        super(PAF, self).__init__()
-        self.conv_s = nn.Conv2d(in_channels, hidden_dim, kernel_size=1)
-        self.conv_v = nn.Conv2d(in_channels, hidden_dim, kernel_size=1) # 将 x_v 投影到 hidden_dim
-        self.conv_spatial = nn.Conv2d(hidden_dim, hidden_dim, kernel_size=kernel_size, stride=stride, padding=padding, groups=hidden_dim)
-        self.conv_out = nn.Conv2d(hidden_dim, in_channels, kernel_size=1) # 投影回 in_channels
-        self.sigmoid = nn.Sigmoid()
-        self.gelu = nn.GELU()
-
-    def forward(self, x_v, x_s):
-        # 将两个输入都投影到相同的隐藏维度
-        x_s_proj = self.conv_s(x_s)
-        x_v_proj = self.conv_v(x_v)
-        
-        x_s_proj = self.gelu(x_s_proj)
-        attn = self.conv_spatial(x_s_proj) # 生成空间注意力图
-        attn = self.sigmoid(attn)
-        
-        # 在隐藏维度上进行乘法
-        x_att = x_v_proj * attn
-        
-        # 投影回原始输入维度
-        return self.conv_out(x_att)
-
-# --- SAVSS_Layer 原始内容 (含修复) ---
 class SAVSS_2D(nn.Module):
     """ 2D选择性扫描状态空间模型 (Selective Scan State Space Model) 的核心实现。"""
     def __init__(
@@ -157,49 +93,64 @@ class SAVSS_2D(nn.Module):
         trunc_normal_(self.direction_Bs, std=0.02)
 
     def sass(self, hw_shape):
-        """生成蛇形扫描顺序 (Serpentine Scan Sequence)。"""
+        """
+        生成蛇形扫描顺序 (Serpentine Scan Sequence)。
+        """
         H, W = hw_shape
         L = H * W
         o1, o2, o3, o4 = [], [], [], []
-        d1, d2, d3, d4 = [], [], [], []
         o1_inverse, o2_inverse, o3_inverse, o4_inverse = [-1] * L, [-1] * L, [-1] * L, [-1] * L
 
-        # 水平蛇形扫描
-        if H % 2 == 1:
-            i, j = H - 1, W - 1
-            j_d = "left"
-        else:
-            i, j = H - 1, 0
-            j_d = "right"
-
-        while i > -1:
-            idx = i * W + j
-            o1_inverse[idx] = len(o1)
-            o1.append(idx)
-            if j_d == "right":
-                if j < W - 1: j += 1; d1.append(1)
-                else: i -= 1; d1.append(3); j_d = "left"
+        # --- 1. 水平蛇形扫描 --- #
+        row, col = 0, 0
+        for i in range(L):
+            o1_inverse[row * W + col] = i
+            o1.append(row * W + col)
+            if row % 2 == 0:
+                if col == W - 1: row += 1
+                else: col += 1
             else:
-                if j > 0: j -= 1; d1.append(2)
-                else: i -= 1; d1.append(3); j_d = "right"
-        d1 = [0] + d1[:-1]
+                if col == 0: row += 1
+                else: col -= 1
 
-        # 垂直蛇形扫描
-        i, j = 0, 0
-        i_d = "down"
-        while j < W:
-            idx = i * W + j
-            o2_inverse[idx] = len(o2)
-            o2.append(idx)
-            if i_d == "down":
-                if i < H - 1: i += 1; d2.append(4)
-                else: j += 1; d2.append(1); i_d = "up"
+        # --- 2. 垂直蛇形扫描 --- #
+        row, col = 0, 0
+        for i in range(L):
+            o2_inverse[row * W + col] = i
+            o2.append(row * W + col)
+            if col % 2 == 0:
+                if row == H - 1: col += 1
+                else: row += 1
             else:
-                if i > 0: i -= 1; d2.append(3)
-                else: j += 1; d2.append(1); i_d = "down"
-        d2 = [0] + d2[:-1]
+                if row == 0: col += 1
+                else: row -= 1
 
-        return (tuple(o1), tuple(o2)), (tuple(o1_inverse), tuple(o2_inverse)), (tuple(d1), tuple(d2))
+        # --- 3. 副对角线蛇形扫描 (左上 -> 右下) --- #
+        diagonals = [[] for _ in range(H + W - 1)]
+        for i in range(H):
+            for j in range(W):
+                diagonals[i + j].append(i * W + j)
+
+        for k, diag in enumerate(diagonals):
+            if k % 2 == 1: diag.reverse()
+            for idx in diag:
+                o3_inverse[idx] = len(o3)
+                o3.append(idx)
+
+        # --- 4. 主对角线蛇形扫描 (右上 -> 左下) --- #
+        diagonals = [[] for _ in range(H + W - 1)]
+        for i in range(H):
+            for j in range(W):
+                diagonals[i - j + (W - 1)].append(i * W + j)
+
+        for k, diag in enumerate(diagonals):
+            if k % 2 == 1: diag.reverse()
+            for idx in diag:
+                o4_inverse[idx] = len(o4)
+                o4.append(idx)
+
+        return (tuple(o1), tuple(o2), tuple(o3), tuple(o4)), \
+               (tuple(o1_inverse), tuple(o2_inverse), tuple(o3_inverse), tuple(o4_inverse))
 
     def forward(self, x, hw_shape):
         batch_size, L, _ = x.shape
@@ -219,22 +170,43 @@ class SAVSS_2D(nn.Module):
         x_dbl = self.x_proj(x_conv)
         dt, B, C = torch.split(x_dbl, [self.dt_rank, self.d_state, self.d_state], dim=-1)
         dt = self.dt_proj(dt).permute(0, 2, 1).contiguous()
-        B = B.permute(0, 2, 1).contiguous()
+        B = B.permute(0, 2, 1).contiguous() # Shape: (B, d_state, L)
         C = C.permute(0, 2, 1).contiguous()
 
-        # 获取扫描顺序和方向
-        orders, inverse_orders, directions = self.sass(hw_shape)
-        direction_Bs = [self.direction_Bs[d, :] for d in directions]
-        direction_Bs = [dB[None, :, :].expand(batch_size, -1, -1).permute(0, 2, 1).to(dtype=B.dtype) for dB in direction_Bs]
+        # 获取扫描顺序
+        orders, inverse_orders = self.sass(hw_shape)
+        
+        # [FIXED] 正确地为每个扫描方向创建可广播的 delta_B 张量
+        delta_Bs = []
+        # 假设水平、垂直、两个对角线分别使用 1, 2, 0, 0 索引
+        dir_indices = [1, 2, 0, 0] 
+        for i in range(self.n_directions):
+            # 从方向参数中获取 1D 向量, shape: (d_state,)
+            d_vec = self.direction_Bs[dir_indices[i], :]
+            # 将其整形为 (1, d_state, 1) 以便与 B (B, d_state, L) 进行广播相加
+            dB = d_vec.unsqueeze(0).unsqueeze(-1)
+            delta_Bs.append(dB)
 
         # 执行选择性扫描
-        y_scan = [
-            selective_scan_fn(
-                x_conv[:, o, :].permute(0, 2, 1).contiguous(), dt, A, (B + dB).contiguous(), C, self.D.float(),
+        y_scan = []
+        for i in range(self.n_directions):
+            scan_order = orders[i]
+            inv_order = inverse_orders[i]
+            delta_B = delta_Bs[i]
+
+            # 对输入序列重新排序
+            x_reordered = x_conv[:, scan_order, :].permute(0, 2, 1).contiguous()
+
+            # 执行扫描
+            y = selective_scan_fn(
+                x_reordered, dt, A, (B + delta_B).contiguous(), C, self.D.float(),
                 z=None, delta_bias=self.dt_proj.bias.float(), delta_softplus=True, return_last_state=False
-            ).permute(0, 2, 1)[:, inv_order, :]
-            for o, inv_order, dB in zip(orders, inverse_orders, direction_Bs)
-        ]
+            )
+
+            # 恢复原始顺序
+            y_unordered = y.permute(0, 2, 1)
+            y_reconstructed = y_unordered[:, inv_order, :]
+            y_scan.append(y_reconstructed)
 
         # 融合多个扫描方向的结果
         y = sum(y_scan) * self.act(z)
@@ -267,9 +239,6 @@ class SAVSS_Layer(nn.Module):
         self.SAVSS_2D = SAVSS_2D(**mamba_cfg) # 核心 Mamba 模块
         self.drop_path = build_dropout(dict(type='DropPath', drop_prob=drop_path_rate))
         
-        num_groups = 16 if embed_dims % 16 == 0 else embed_dims % 8 if embed_dims % 8 == 0 else embed_dims % 4 if embed_dims % 4 == 0 else 2
-        self.GN = nn.GroupNorm(num_channels=embed_dims, num_groups=num_groups)
-        self.linear = nn.Linear(in_features=embed_dims, out_features=embed_dims, bias=True)
         self.GBC_C = GBC(embed_dims) # 全局瓶颈卷积
         self.PAF = PAF(embed_dims, embed_dims // 2) # 金字塔注意力融合
 

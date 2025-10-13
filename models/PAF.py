@@ -1,64 +1,46 @@
 # Copyright (c) Roy. All rights reserved.
-#
-# This source code is licensed under the license found in the
-# LICENSE file in the root directory of this source tree.
 
-import torch
 import torch.nn as nn
-import torch.nn.functional as F
-from models.GBC import BottConv
 
 class PAF(nn.Module):
-    """金字塔注意力融合模块 (Pyramid Attention Fusion) 的原始实现。 
+    """金字塔注意力融合模块 (Pyramid Attention Fusion)。
     
-    该模块通过计算一个相似度图 (similarity map) 来动态地融合
-    一个基础特征 (base_feat) 和一个引导特征 (guidance_feat)。
+    该模块通过一个注意力机制，使用一个特征图 (x_s, a.k.a. query) 来
+    动态地加权另一个特征图 (x_v, a.k.a. value)，从而实现特征的融合。
     """
-    def __init__(self,
-                 in_channels: int,
-                 mid_channels: int,
-                 after_relu: bool = False,
-                 mid_norm: nn.Module = nn.BatchNorm2d,
-                 in_norm: nn.Module = nn.BatchNorm2d):
-        super().__init__()
-        self.after_relu = after_relu
-
-        # 用于将输入特征转换到中间维度的瓶颈卷积
-        self.feature_transform = nn.Sequential(
-            BottConv(in_channels, mid_channels, mid_channels=16, kernel_size=1),
-            mid_norm(mid_channels)
-        )
-
-        # 用于将融合后的特征转换回输入维度的通道适配器
-        self.channel_adapter = nn.Sequential(
-            BottConv(mid_channels, in_channels, mid_channels=16, kernel_size=1),
-            in_norm(in_channels)
-        )
-
-        if after_relu:
-            self.relu = nn.ReLU(inplace=True)
-
-    def forward(self, base_feat: torch.Tensor, guidance_feat: torch.Tensor) -> torch.Tensor:
-        base_shape = base_feat.size()
-
-        if self.after_relu:
-            base_feat = self.relu(base_feat)
-            guidance_feat = self.relu(guidance_feat)
-
-        # 分别转换引导特征和基础特征
-        guidance_query = self.feature_transform(guidance_feat)
-        base_key = self.feature_transform(base_feat)
+    def __init__(self, in_channels, hidden_dim, kernel_size=3, padding=1, stride=1):
+        super(PAF, self).__init__()
+        # 1x1 卷积，用于将 query 特征投影到隐藏维度
+        self.conv_s = nn.Conv2d(in_channels, hidden_dim, kernel_size=1)
+        # 1x1 卷积，用于将 value 特征投影到隐藏维度
+        self.conv_v = nn.Conv2d(in_channels, hidden_dim, kernel_size=1)
         
-        # 将引导特征的尺寸插值到与基础特征一致
-        guidance_query = F.interpolate(guidance_query, size=[base_shape[2], base_shape[3]], mode='bilinear', align_corners=False)
+        # 深度可分离卷积，用于高效地生成空间注意力图
+        self.conv_spatial = nn.Conv2d(hidden_dim, hidden_dim, kernel_size=kernel_size, stride=stride, padding=padding, groups=hidden_dim)
         
-        # 通过将转换后的特征相乘，并经过通道适配器和 sigmoid 来计算相似度图
-        similarity_map = torch.sigmoid(self.channel_adapter(base_key * guidance_query))
+        # 1x1 卷积，用于将融合后的特征投影回原始通道数
+        self.conv_out = nn.Conv2d(hidden_dim, in_channels, kernel_size=1)
         
-        # 将原始引导特征的尺寸也插值到与基础特征一致
-        resized_guidance = F.interpolate(guidance_feat, size=[base_shape[2], base_shape[3]], mode='bilinear', align_corners=False)
+        self.sigmoid = nn.Sigmoid()
+        self.gelu = nn.GELU()
 
-        # 使用相似度图作为权重，在基础特征和引导特征之间进行加权融合
-        fused_feature = (1 - similarity_map) * base_feat + similarity_map * resized_guidance
-
-        return fused_feature
+    def forward(self, x_v, x_s):
+        """
+        Args:
+            x_v (torch.Tensor): Value 特征图，将被加权。
+            x_s (torch.Tensor): Query 特征图，用于生成权重。
+        """
+        # 将两个输入都投影到相同的隐藏维度
+        x_s_proj = self.conv_s(x_s)
+        x_v_proj = self.conv_v(x_v)
+        
+        # 生成空间注意力图
+        x_s_proj = self.gelu(x_s_proj)
+        attn = self.conv_spatial(x_s_proj)
+        attn = self.sigmoid(attn) # 使用 sigmoid 将权重缩放到 (0, 1) 范围
+        
+        # 在隐藏维度上进行加权融合
+        x_att = x_v_proj * attn
+        
+        # 投影回原始输入维度
+        return self.conv_out(x_att)
