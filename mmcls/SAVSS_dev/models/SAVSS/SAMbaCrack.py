@@ -52,7 +52,7 @@ class SAMbaCrack(nn.Module):
 
         self.backbone = SAMbaCrackEncoder(
             sam_dims=[96, 192, 384, 768],
-            token_dim=256,
+            token_dim=128, # <-- [MODIFIED] SAVSS 块间维度已更改
             patch_size=8,
             load_height=args.load_height,
             load_width=args.load_width

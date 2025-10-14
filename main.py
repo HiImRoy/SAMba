@@ -25,6 +25,8 @@ from util.logger import get_logger
 from mmengine.optim.scheduler.lr_scheduler import PolyLR
 # --- [NEW] Import for FLOPs calculation ---
 from thop import profile
+# --- [MODIFIED] Import the new loss function ---
+from models.decoder import CompositeLoss
 
 
 # --- [FIXED] Helper function for FLOPs calculation ---
@@ -185,10 +187,13 @@ def get_args_parser():
     parser.add_argument('--pretrained_weights', type=str, default='sam2_checkpoints/sam2.1_hiera_base_plus.pt',
                         help='Path to the pretrained Hiera weights.')
 
-    parser.add_argument('--BCELoss_ratio', default=0.5, type=float,
-                        help="Weight for BCE Loss in the total loss function.")
-    parser.add_argument('--DiceLoss_ratio', default=0.5, type=float,
-                        help="Weight for Dice Loss in the total loss function.")
+    # --- [MODIFIED] New loss weights for CompositeLoss ---
+    parser.add_argument('--bce_weight', default=0.5, type=float,
+                        help="Weight for the standard BCE Loss component.")
+    parser.add_argument('--dice_weight', default=0.3, type=float,
+                        help="Weight for the Dice Loss component.")
+    parser.add_argument('--brl_weight', default=0.2, type=float,
+                        help="Weight for the Boundary Refinement Loss (BRL) component.")
 
     parser.add_argument('--Norm_Type', default='GN', type=str)
     parser.add_argument('--dataset_path', default="data/CrackTree260")
@@ -196,7 +201,7 @@ def get_args_parser():
     parser.add_argument('--batch_size_test', type=int, default=1)
 
     parser.add_argument('--lr_scheduler', type=str, default='PolyLR', help='LR scheduler to use.')
-    parser.add_argument('--lr', default=5e-4, type=float, help="The initial learning rate for PolyLR.")
+    parser.add_argument('--lr', default=1e-4, type=float, help="The initial learning rate for PolyLR.")
 
     parser.add_argument('--clip_grad_norm', default=1.0, type=float,
                         help="Gradient clipping norm value (0 for no clipping).")
@@ -261,9 +266,15 @@ def main(args):
     np.random.seed(args.seed)
     random.seed(args.seed)
 
-    log.info("--- Building Model ---")
-    model, criterion = build_model(args)
+    log.info("--- Building Model and Loss ---")
+    # The build_model function is expected to return only the model.
+    model = build_model(args)
     model.to(device)
+
+    # --- [MODIFIED] Manually instantiate the new CompositeLoss --- 
+    log.info(f"Instantiating new CompositeLoss with weights -> BCE: {args.bce_weight}, Dice: {args.dice_weight}, BRL: {args.brl_weight}")
+    criterion = CompositeLoss(args)
+    criterion.to(device)
 
     if hasattr(model, 'init_weights') and not args.resume:
         log.info(f"Initializing weights... Will use pretrained weights if path is provided.")

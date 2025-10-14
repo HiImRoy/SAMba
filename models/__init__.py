@@ -12,7 +12,8 @@ if project_root not in sys.path:
 """Model factory."""
 
 import torch
-from models.decoder import bce_dice
+
+# [MODIFIED] Removed obsolete import of bce_dice
 
 # [FIXED] 导入我们最终组装好的、正确的 SAMbaCrack 模型
 from mmcls.SAVSS_dev.models.SAVSS.SAMbaCrack import SAMbaCrack
@@ -22,8 +23,9 @@ from models.unet_baseline import UNetBaseline
 
 def build_model(args):
     """
-    构建模型和损失函数。
-    该函数现在会根据 model_name 构建我们最终确定的 SAMbaCrack-AF 架构。
+    构建模型。
+    该函数现在只负责根据 model_name 构建并返回模型实例。
+    损失函数的创建已移至 main.py 中。
     """
     device = torch.device(args.device)
     model = None
@@ -41,8 +43,5 @@ def build_model(args):
     else:
         raise ValueError(f"无法识别模型 \'{args.model_name}\'。")
 
-    # 损失函数保持不变，仍然使用 bce_dice 组合损失
-    criterion = bce_dice(args)
-    criterion.to(device)
-
-    return model, criterion
+    # [MODIFIED] 移除损失函数的创建逻辑，只返回模型
+    return model
