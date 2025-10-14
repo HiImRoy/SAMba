@@ -185,9 +185,9 @@ def get_args_parser():
     parser.add_argument('--pretrained_weights', type=str, default='sam2_checkpoints/sam2.1_hiera_base_plus.pt',
                         help='Path to the pretrained Hiera weights.')
 
-    parser.add_argument('--BCELoss_ratio', default=0.83, type=float,
+    parser.add_argument('--BCELoss_ratio', default=0.5, type=float,
                         help="Weight for BCE Loss in the total loss function.")
-    parser.add_argument('--DiceLoss_ratio', default=0.17, type=float,
+    parser.add_argument('--DiceLoss_ratio', default=0.5, type=float,
                         help="Weight for Dice Loss in the total loss function.")
 
     parser.add_argument('--Norm_Type', default='GN', type=str)
@@ -196,7 +196,7 @@ def get_args_parser():
     parser.add_argument('--batch_size_test', type=int, default=1)
 
     parser.add_argument('--lr_scheduler', type=str, default='PolyLR', help='LR scheduler to use.')
-    parser.add_argument('--lr', default=1e-4, type=float, help="The initial learning rate for PolyLR.")
+    parser.add_argument('--lr', default=5e-4, type=float, help="The initial learning rate for PolyLR.")
 
     parser.add_argument('--clip_grad_norm', default=1.0, type=float,
                         help="Gradient clipping norm value (0 for no clipping).")
@@ -206,14 +206,14 @@ def get_args_parser():
 
     parser.add_argument('--min_lr', default=1e-6, type=float)
     parser.add_argument('--weight_decay', default=0.01, type=float)
-    parser.add_argument('--epochs', default=300, type=int)
+    parser.add_argument('--epochs', default=75, type=int)
     parser.add_argument('--start_epoch', default=0, type=int)
 
     parser.add_argument('--resume', default='', type=str, help='Path to checkpoint to resume training from.')
 
     parser.add_argument('--lr_drop', default=30, type=int)
     parser.add_argument('--sgd', action='store_true')
-    parser.add_argument('--output_dir', default='./results/FPN', help='Root directory for all outputs')
+    parser.add_argument('--output_dir', default='./results/UNet', help='Root directory for all outputs')
     parser.add_argument('--device', default='cuda')
     parser.add_argument('--seed', default=42, type=int)
     parser.add_argument('--dataset_mode', type=str, default='crack')
@@ -342,7 +342,6 @@ def main(args):
         test_dl = create_dataset(args)
         with torch.no_grad():
             model.eval()
-            # --- [FIXED] Final fix for validation loop to handle all data formats and save correctly ---
             for i, data in enumerate(tqdm(test_dl, desc=f"Testing Epoch {epoch}")):
                 if isinstance(data, (list, tuple)):
                     if len(data) == 3:
@@ -353,7 +352,6 @@ def main(args):
                         root_name = f"val_image_{i}"
                     x = x.to(device)
                     target_np = target_tensor.cpu().numpy()
-                    # [FIXED] Correctly get the 2D mask and ensure it's uint8 [0, 255]
                     target_to_save = target_np[0].astype(np.uint8)
                 else:
                     x = data["image"].to(device)
@@ -365,7 +363,6 @@ def main(args):
                 prob_map_0_1 = torch.sigmoid(out)
                 prob_map_uint8 = (prob_map_0_1[0, 0] * 255).cpu().numpy().astype(np.uint8)
                 
-                # Save prediction and label with the correct names for eval.py
                 cv2.imwrite(str(temp_eval_dir / f"{root_name}_pre.png"), prob_map_uint8)
                 cv2.imwrite(str(temp_eval_dir / f"{root_name}_lab.png"), target_to_save)
 

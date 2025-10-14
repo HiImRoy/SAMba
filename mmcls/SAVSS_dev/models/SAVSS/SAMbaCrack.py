@@ -8,22 +8,13 @@ import numpy as np
 # 使用从项目根目录开始的绝对导入路径
 from mmcls.models.backbones.samba_crack_encoder import SAMbaCrackEncoder
 from mmcls.models.necks.af_neck import AFNeck
-from models.MFS import MFSHead
+# --- [MODIFIED] 导入全新的 UNetDecoderHead --- #
+from models.unet_decoder import UNetDecoderHead
 
 
 def edge_conv2d(image_tensor: torch.Tensor) -> torch.Tensor:
     """
     使用固定的 Sobel 算子对图像进行边缘检测。
-
-    该函数包含4个方向 (0°, 45°, 90°, 135°) 的 Sobel 卷积核，
-    对输入的图像张量进行卷积，并将结果融合成一个边缘图。
-    整个过程不可训练。
-
-    Args:
-        image_tensor (torch.Tensor): 输入的图像张量，形状为 (B, 3, H, W)。
-
-    Returns:
-        torch.Tensor: 输出的边缘图，形状为 (B, 3, H, W)。
     """
     with torch.no_grad():
         image_gray = image_tensor.mean(dim=1, keepdim=True)
@@ -50,18 +41,11 @@ def edge_conv2d(image_tensor: torch.Tensor) -> torch.Tensor:
 class SAMbaCrack(nn.Module):
     """
     最终的 SAMbaCrack-AF 模型。
-
-    该类将模块化的 主干(Backbone), 颈部(Neck), 和 头部(Head) 组装成一个
-    单一的、端到端的 nn.Module，以便于直接在 Python 脚本中实例化和调用。
-    作者: Roy
     """
 
     def __init__(self, args, **kwargs):
         """
         初始化 SAMbaCrack-AF 模型。
-
-        Args:
-            args: 包含所有模型超参数的参数对象。
         """
         super(SAMbaCrack, self).__init__()
         self.args = args
@@ -78,29 +62,21 @@ class SAMbaCrack(nn.Module):
             in_channels_list=[96, 192, 384, 768]
         )
 
-        self.head = MFSHead(
-            in_channels=[96, 192, 384, 768],
-            embedding_dim=8,
-            dropout_ratio=0.1
+        # --- [MODIFIED] 使用全新的 UNetDecoderHead 替换 MFSHead ---
+        self.head = UNetDecoderHead(
+            in_channels=[96, 192, 384, 768]
+            # 使用 UNetDecoderHead 的默认 final_embedding_dim=16
         )
 
     def forward(self, x):
         """
         定义模型的完整前向传播路径。
-
-        Args:
-            x (torch.Tensor): 输入的图像张量，形状为 (B, 3, H, W)。
-
-        Returns:
-            torch.Tensor: 模型输出的全分辨率 logits，形状为 (B, 1, H, W)。
         """
-        # 1. 生成边缘先验图
-        x_edge = edge_conv2d(x)
+        # 1. 生成边缘先验图 (当前版本已移除，直接使用原始图像)
+        # x_edge = edge_conv2d(x)
 
-        # 2. 通过主干网络，将原始图像和边缘图分别送入两个分支
-        #    - x (原始图像) -> SAM/Hiera 分支
-        #    - x_edge (边缘图) -> SAVSS/Mamba 分支
-        feats_sam, feats_mamba = self.backbone(x, x_edge)
+        # 2. 通过主干网络
+        feats_sam, feats_mamba = self.backbone(x, x)
 
         # 3. 通过颈部模块，得到一个融合后的特征金字塔
         fused_feats = self.neck(feats_sam, feats_mamba)
@@ -112,7 +88,7 @@ class SAMbaCrack(nn.Module):
 
     def init_weights(self, pretrained=None):
         """
-        初始化权重。这里主要用于加载 SAM 编码器的预训练权重。
+        初始化权重。
         """
         if hasattr(self.backbone, 'init_weights'):
             self.backbone.init_weights(pretrained)
