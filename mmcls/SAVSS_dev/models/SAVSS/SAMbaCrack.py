@@ -20,6 +20,7 @@ from mmcls.SAVSS_dev.models.samba_unet_modules.hiera import Hiera
 from mmcls.SAVSS_dev.models.samba_unet_modules.refiner_adapter import DynamicFeatureFusionRefiner, MLPAdapter
 from mmcls.SAVSS_dev.models.samba_unet_modules.hoacm import HOACM
 from mmcls.SAVSS_dev.models.SAVSS.SAVSS_layer import SAVSS_Layer
+from models.DySample import DySample
 
 # --- 【新增】U-Net 风格解码器模块，用于精细化特征重建 ---
 class DecoderBlock(nn.Module):
@@ -54,41 +55,43 @@ class DecoderBlock(nn.Module):
         return self.conv(x)
 
 class UNetDecoder(nn.Module):
-    """U-Net 风格的解码器，逐级融合多尺度特征以重建分割细节。"""
+    """U-Net 风格的解码器，使用 DySample 进行高质量上采样。"""
     def __init__(self, decoder_channels):
         super().__init__()
         # decoder_channels 对应 c1, c2, c3, c4 的维度: [64, 128, 256, 512]
         c1_dim, c2_dim, c3_dim, c4_dim = decoder_channels
 
         # 解码器从最深层 (c4) 开始，逐级向上融合
-        # Block 1: 融合 c4 和 c3
         self.block1 = DecoderBlock(in_channels=c4_dim, skip_channels=c3_dim, out_channels=c3_dim)
-        # Block 2: 融合 block1 的输出和 c2
         self.block2 = DecoderBlock(in_channels=c3_dim, skip_channels=c2_dim, out_channels=c2_dim)
-        # Block 3: 融合 block2 的输出和 c1
         self.block3 = DecoderBlock(in_channels=c2_dim, skip_channels=c1_dim, out_channels=c1_dim)
 
-        # 分割头，将最终的高分辨率特征图转换为单通道的 logits
-        self.segmentation_head = nn.Conv2d(c1_dim, 1, kernel_size=1)
+        # 【新】使用两个 DySample 模块实现 4x 上采样 (112 -> 224 -> 448)
+        self.dysample_x2 = DySample(c1_dim, scale=2, style='lp', groups=c1_dim)
+        self.dysample_x4 = DySample(c1_dim, scale=2, style='lp', groups=c1_dim)
 
-    def forward(self, features, final_size):
+        # 【新】最终的通道融合卷积层
+        self.final_conv = nn.Conv2d(c1_dim, 1, kernel_size=1)
+
+
+    def forward(self, features):
         """
         Args:
             features (tuple): 包含4个尺度特征图的元组 (c4, c3, c2, c1)。
-            final_size (tuple): 最终输出 logits 需要被上采样到的目标尺寸 (H, W)。
         """
         c4, c3, c2, c1 = features
 
         # 解码路径
-        x = self.block1(c4, c3)    # 输出尺寸与 c3 相同
-        x = self.block2(x, c2)    # 输出尺寸与 c2 相同
-        x = self.block3(x, c1)    # 输出尺寸与 c1 相同 (e.g., 112x112)
+        x = self.block1(c4, c3)    # 输出: (B, 256, 28, 28)
+        x = self.block2(x, c2)    # 输出: (B, 128, 56, 56)
+        x = self.block3(x, c1)    # 输出: (B, 64, 112, 112)
 
-        # 应用分割头
-        logits = self.segmentation_head(x)
+        # 【新】使用 DySample 进行高质量上采样
+        x = self.dysample_x2(x)   # 输出: (B, 64, 224, 224)
+        x = self.dysample_x4(x)   # 输出: (B, 64, 448, 448)
 
-        # 将 logits 上采样到原始输入图像的尺寸
-        logits = F.interpolate(logits, size=final_size, mode='bilinear', align_corners=False)
+        # 【新】应用最终的卷积层生成 logits
+        logits = self.final_conv(x) # 输出: (B, 1, 448, 448)
 
         return logits
 
@@ -166,54 +169,61 @@ class SAMbaCrack(nn.Module):
         # 这个解码器接收 HOACM 输出的特征维度列表，以构建经典的 U-Net 上采样路径。
         self.decoder = UNetDecoder(decoder_channels=savss_dims)
 
-    def forward(self, x):
-        with torch.no_grad():
-            sam_features = self.sam_encoder(x)
-        
-        refined_sam_features = []
-        for i in range(len(sam_features)):
-            sam_feature_detached = sam_features[i].clone().detach()
-            refined = self.refiners[i](sam_feature_detached)
-            adapted = self.adapters[i](sam_feature_detached)
-            refined_sam_features.append(refined + adapted)
-
+    def forward(self, x, stage=2):
+        # --- SAVSS (Mamba) 分支总会运行 ---
         mamba_features = []
         mamba_x_token = self.savss_patch_embed(x)
         mamba_x_token = mamba_x_token + self.savss_pos_embed
         B, L, C = mamba_x_token.shape
         H = W = int(L**0.5)
 
-        for i, stage in enumerate(self.mamba_encoder):
-            mamba_x_token = stage['block'](mamba_x_token, (H, W))
+        for i, mamba_stage in enumerate(self.mamba_encoder):
+            mamba_x_token = mamba_stage['block'](mamba_x_token, (H, W))
             mamba_x_2d = mamba_x_token.transpose(1, 2).reshape(B, C, H, W)
             mamba_features.append(mamba_x_2d)
             
             if i < len(self.mamba_encoder) - 1:
-                mamba_x_2d_down = stage['downsample'](mamba_x_2d)
+                mamba_x_2d_down = mamba_stage['downsample'](mamba_x_2d)
                 B, C, H, W = mamba_x_2d_down.shape
                 mamba_x_token = mamba_x_2d_down.reshape(B, C, -1).transpose(1, 2)
 
-        fused_features = []
-        for i in range(4):
-            sam_feat = refined_sam_features[i]
-            mamba_feat = mamba_features[i]
-
-            if sam_feat.shape[-2:] != mamba_feat.shape[-2:]:
-                sam_feat = F.interpolate(
-                    sam_feat, 
-                    size=mamba_feat.shape[-2:], 
-                    mode='bilinear', 
-                    align_corners=False
-                )
+        # --- 根据训练阶段选择数据流 ---
+        if stage == 1:
+            # 阶段一：直接将 Mamba 特征送入解码器
+            decoder_input = (mamba_features[3], mamba_features[2], mamba_features[1], mamba_features[0])
+        else: # 默认 stage 2
+            # 阶段二：运行 Hiera 分支并进行融合
+            with torch.no_grad():
+                sam_features = self.sam_encoder(x)
             
-            sam_feat_adapted = self.sam_adapters[i](sam_feat)
-            fused = self.hoacms[i](sam_feat_adapted, mamba_feat)
-            fused_features.append(fused)
+            refined_sam_features = []
+            for i in range(len(sam_features)):
+                sam_feature_detached = sam_features[i].clone().detach()
+                refined = self.refiners[i](sam_feature_detached)
+                adapted = self.adapters[i](sam_feature_detached)
+                refined_sam_features.append(refined + adapted)
 
-        # **【重构】**: 将融合后的特征按 (c4, c3, c2, c1) 顺序送入新的 U-Net 解码器。
-        decoder_input = (fused_features[3], fused_features[2], fused_features[1], fused_features[0])
-        logits = self.decoder(decoder_input, final_size=x.shape[-2:])
+            fused_features = []
+            for i in range(4):
+                sam_feat = refined_sam_features[i]
+                mamba_feat = mamba_features[i]
 
+                if sam_feat.shape[-2:] != mamba_feat.shape[-2:]:
+                    sam_feat = F.interpolate(
+                        sam_feat, 
+                        size=mamba_feat.shape[-2:], 
+                        mode='bilinear', 
+                        align_corners=False
+                    )
+                
+                sam_feat_adapted = self.sam_adapters[i](sam_feat)
+                fused = self.hoacms[i](sam_feat_adapted, mamba_feat)
+                fused_features.append(fused)
+            
+            decoder_input = (fused_features[3], fused_features[2], fused_features[1], fused_features[0])
+
+        # --- 解码器接收处理后的特征 ---
+        logits = self.decoder(decoder_input)
         return logits
 
     def init_weights(self, pretrained=None):

@@ -65,24 +65,25 @@ class DySample(nn.Module):
         """核心采样函数，使用 F.grid_sample 执行采样。"""
         B, _, H, W = offset.shape
         offset = offset.view(B, 2, -1, H, W)
-        
+
         # 创建基础坐标网格
         coords_h = torch.arange(H) + 0.5
         coords_w = torch.arange(W) + 0.5
         coords = torch.stack(torch.meshgrid([coords_w, coords_h], indexing='ij')
                              ).transpose(1, 2).unsqueeze(1).unsqueeze(0).type(x.dtype).to(x.device)
-        
+
         # 归一化坐标到 [-1, 1] 范围
         normalizer = torch.tensor([W, H], dtype=x.dtype, device=x.device).view(1, 2, 1, 1, 1)
         coords = 2 * (coords + offset) / normalizer - 1
-        
-        # 使用 pixel_shuffle 调整坐标以匹配上采样后的分辨率
-        coords = F.pixel_shuffle(coords.view(B, -1, H, W), self.scale).view(
+
+        # 【最终修复】使用 pixel_shuffle 调整坐标以匹配上采样后的分辨率
+        # 将 coords.view() 替换为 coords.reshape() 以处理因 transpose 导致的非连续张量
+        coords = F.pixel_shuffle(coords.reshape(B, -1, H, W), self.scale).reshape(
             B, 2, -1, self.scale * H, self.scale * W).permute(0, 2, 3, 4, 1).contiguous().flatten(0, 1)
-        
+
         # 执行网格采样
         return F.grid_sample(x.reshape(B * self.groups, -1, H, W), coords, mode='bilinear',
-                             align_corners=False, padding_mode="border").view(B, -1, self.scale * H, self.scale * W)
+                             align_corners=False, padding_mode="border").reshape(B, -1, self.scale * H, self.scale * W)
 
     def forward_lp(self, x):
         """ 'lp' 风格的前向传播 (learn-pixel-shuffle) """
@@ -105,3 +106,4 @@ class DySample(nn.Module):
         if self.style == 'pl':
             return self.forward_pl(x)
         return self.forward_lp(x)
+''

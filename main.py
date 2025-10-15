@@ -35,7 +35,7 @@ def log_parameter_summary(model, log, args):
     try:
         # Create a dummy input tensor with the correct size and device
         dummy_input = torch.randn(1, 3, args.load_height, args.load_width).to(next(model.parameters()).device)
-        flops, params = profile(model, inputs=(dummy_input,))
+        flops, params = profile(model, inputs=(dummy_input, args.training_stage))
         log.info(f"FLOPs: {flops / 1e9:.2f} G")
     except Exception as e:
         log.warning(f"Could not calculate FLOPs: {e}")
@@ -138,7 +138,7 @@ def save_best_masks(model, device, args, output_dir, best_threshold):
     with torch.no_grad():
         for data in tqdm(test_dl, desc="Generating best masks"):
             x, target = data["image"].to(device), data["label"].to(device)
-            out = model(x)
+            out = model(x, stage=args.training_stage)
 
             label_np = target[0, 0].cpu().numpy()
 
@@ -165,11 +165,15 @@ def get_args_parser():
     parser.add_argument('--model_name', default='SAMbaCrack', type=str)
     parser.add_argument('--pretrained_weights', type=str, default='sam2_checkpoints/sam2.1_hiera_base_plus.pt', help='Path to the pretrained Hiera weights.')
 
+    # --- Two-Stage Training Arguments ---
+    parser.add_argument('--training_stage', default=1, type=int, choices=[1, 2], help="Set training stage: 1 for Mamba+Decoder, 2 for full model fine-tuning.")
+    parser.add_argument('--stage1_weights', type=str, default='', help='Path to stage 1 checkpoint, required for starting stage 2.')
+
     parser.add_argument('--BCELoss_ratio', default=0.83, type=float, help="Weight for BCE Loss in the total loss function.")
     parser.add_argument('--DiceLoss_ratio', default=0.17, type=float, help="Weight for Dice Loss in the total loss function.")
 
     parser.add_argument('--Norm_Type', default='GN', type=str)
-    parser.add_argument('--dataset_path', default="data/crack500")
+    parser.add_argument('--dataset_path', default="data/CFD")
     parser.add_argument('--batch_size_train', type=int, default=8)
     parser.add_argument('--batch_size_test', type=int, default=8)
 
@@ -189,7 +193,7 @@ def get_args_parser():
 
     parser.add_argument('--lr_drop', default=30, type=int)
     parser.add_argument('--sgd', action='store_true')
-    parser.add_argument('--output_dir', default='./results', help='Root directory for all outputs')
+    parser.add_argument('--output_dir', default='./results/samba_v11', help='Root directory for all outputs')
     parser.add_argument('--device', default='cuda')
     parser.add_argument('--seed', default=42, type=int)
     parser.add_argument('--dataset_mode', type=str, default='crack')
@@ -201,15 +205,19 @@ def get_args_parser():
     return parser
 
 def main(args):
-    # --- [MODIFIED] Simplified output directory and logger setup ---
+    # --- [MODIFIED] Set up stage-specific output directory ---
     if args.resume:
-        output_dir = Path(args.resume).parent.parent
-        exp_name = output_dir.name
+        # Infer base experiment directory from resume path
+        stage_dir = Path(args.resume).parent.parent
+        exp_dir = stage_dir.parent
     else:
         cur_time = datetime.datetime.now().strftime('%Y%m%d-%H%M%S')
         dataset_name = Path(args.dataset_path).name
         exp_name = f"{cur_time}_{args.model_name}_{dataset_name}"
-        output_dir = Path(args.output_dir) / exp_name
+        exp_dir = Path(args.output_dir) / exp_name
+
+    # Define stage-specific sub-directory
+    output_dir = exp_dir / f'stage{args.training_stage}'
 
     weights_dir = output_dir / 'weights'
     masks_dir = output_dir / 'best_epoch_masks'
@@ -220,14 +228,13 @@ def main(args):
     masks_dir.mkdir(exist_ok=True)
     plots_dir.mkdir(exist_ok=True)
 
-    # The get_logger function now handles append mode automatically.
     log = get_logger(output_dir, 'experiment_log')
     
-    # Print resume message if resuming
     if args.resume:
         log.info("\n" + "="*20 + " RESUMING TRAINING " + "="*20 + "\n")
         
-    log.info(f"Experiment started: {exp_name}")
+    log.info(f"Experiment started: {exp_dir.name}")
+    log.info(f"Current Stage: {args.training_stage}")
     log.info(f"Results will be saved to: {output_dir}")
     log.info("--- Hyperparameters ---")
     for arg, value in sorted(vars(args).items()):
@@ -243,9 +250,76 @@ def main(args):
     model, criterion = build_model(args)
     model.to(device)
 
-    if hasattr(model, 'init_weights') and not args.resume:
-        log.info(f"Initializing weights... Will use pretrained weights if path is provided.")
+    # Load Hiera backbone weights if not resuming and path is provided
+    if not args.resume and args.pretrained_weights:
+        log.info(f"Initializing Hiera backbone weights...")
         model.init_weights(args.pretrained_weights)
+
+    # --- [NEW] Load Stage 1 weights if starting Stage 2 ---
+    if args.training_stage == 2 and args.stage1_weights:
+        if os.path.isfile(args.stage1_weights):
+            log.info(f"--- Loading Stage 1 weights from: {args.stage1_weights} ---")
+            checkpoint = torch.load(args.stage1_weights, map_location='cpu')
+            # Load with strict=False, as fusion modules are not in the stage 1 checkpoint
+            missing_keys, unexpected_keys = model.load_state_dict(checkpoint['model'], strict=False)
+            log.info(f"Stage 1 weights loaded. Missing keys: {len(missing_keys)}, Unexpected keys: {len(unexpected_keys)}")
+        else:
+            log.warning(f"Stage 1 checkpoint not found at {args.stage1_weights}. Fusion modules will be trained from scratch.")
+
+    # --- [NEW] Setup Optimizer based on Training Stage ---
+    param_dicts = []
+    if args.training_stage == 1:
+        log.info("--- Optimizer Setup: STAGE 1 ---")
+        log.info("Training: Mamba Encoder + Decoder")
+        # Freeze all parameters first
+        for param in model.parameters():
+            param.requires_grad = False
+        # Unfreeze Mamba and Decoder parts
+        trainable_modules = [model.savss_patch_embed, model.mamba_encoder, model.decoder]
+        for module in trainable_modules:
+            for param in module.parameters():
+                param.requires_grad = True
+        model.savss_pos_embed.requires_grad = True
+        
+        params_to_train = [p for p in model.parameters() if p.requires_grad]
+        param_dicts = [{"params": params_to_train, "lr": args.lr}]
+        log.info(f"Number of trainable parameters in Stage 1: {sum(p.numel() for p in params_to_train)}")
+
+    else: # Stage 2
+        log.info("--- Optimizer Setup: STAGE 2 ---")
+        log.info("Training: Fusion Modules (from scratch) + Fine-tuning Mamba/Decoder")
+        # Freeze all parameters first
+        for param in model.parameters():
+            param.requires_grad = False
+        
+        # Define modules to train from scratch and modules to fine-tune
+        scratch_modules = [model.refiners, model.adapters, model.sam_adapters, model.hoacms]
+        finetune_modules = [model.savss_patch_embed, model.mamba_encoder, model.decoder]
+
+        # Unfreeze and collect parameters
+        scratch_params = []
+        for module in scratch_modules:
+            for param in module.parameters():
+                param.requires_grad = True
+                scratch_params.append(param)
+
+        finetune_params = []
+        for module in finetune_modules:
+            for param in module.parameters():
+                param.requires_grad = True
+                finetune_params.append(param)
+        model.savss_pos_embed.requires_grad = True
+        finetune_params.append(model.savss_pos_embed)
+
+        param_dicts = [
+            {"params": scratch_params, "lr": args.lr},
+            {"params": finetune_params, "lr": args.lr * args.lr_backbone_multiplier},
+        ]
+        log.info(f"Number of scratch parameters: {sum(p.numel() for p in scratch_params)}")
+        log.info(f"Number of fine-tuning parameters: {sum(p.numel() for p in finetune_params)}")
+
+    optimizer = torch.optim.AdamW(param_dicts, lr=args.lr, weight_decay=args.weight_decay)
+    lr_scheduler = PolyLR(optimizer, eta_min=args.min_lr, begin=args.start_epoch, end=args.epochs)
 
     log_parameter_summary(model, log, args)
 
@@ -254,24 +328,6 @@ def main(args):
     train_dataLoader = create_dataset(args)
     log.info(f'The number of training images = {len(train_dataLoader.dataset)}')
     log.info(f'Number of training batches = {len(train_dataLoader)}')
-
-    if args.model_name == 'SAMbaCrack' and hasattr(model, 'refiners'):
-        log.info("Creating optimizer with separate parameter groups for SAMbaCrack (finetuning vs. scratch).")
-        finetune_param_ids = set(map(id, model.refiners.parameters())) | set(map(id, model.adapters.parameters()))
-        scratch_params = [p for p in model.parameters() if p.requires_grad and id(p) not in finetune_param_ids]
-        finetune_params = [p for p in model.parameters() if p.requires_grad and id(p) in finetune_param_ids]
-
-        param_dicts = [
-            {"params": scratch_params, "lr": args.lr},
-            {"params": finetune_params, "lr": args.lr * args.lr_backbone_multiplier},
-        ]
-        optimizer = torch.optim.AdamW(param_dicts, lr=args.lr, weight_decay=args.weight_decay)
-    else:
-        log.info(f"Creating optimizer with a single parameter group for {args.model_name}.")
-        param_dicts = [{"params": [p for p in model.parameters() if p.requires_grad], "lr": args.lr}]
-        optimizer = torch.optim.AdamW(param_dicts, lr=args.lr, weight_decay=args.weight_decay)
-
-    lr_scheduler = PolyLR(optimizer, eta_min=args.min_lr, begin=args.start_epoch, end=args.epochs)
 
     if args.resume:
         if os.path.isfile(args.resume):
@@ -285,7 +341,7 @@ def main(args):
         else:
             log.warning(f"Checkpoint file not found at {args.resume}. Starting from scratch.")
 
-    log.info("--- Starting Training ---")
+    log.info(f"--- Starting Training (Stage {args.training_stage}) ---")
     start_time = time.time()
     best_mIoU = 0.0
     best_metrics_from_best_mIoU_epoch = {}
@@ -295,7 +351,6 @@ def main(args):
         log.info(f"Loading previous logs from {log_csv_path}")
         log_df = pd.read_csv(log_csv_path)
         log_data = log_df.to_dict('records')
-        # --- [MODIFIED] Added check for empty mIoU column to prevent errors ---
         if 'mIoU' in log_df.columns and not log_df['mIoU'].empty:
             best_mIoU = log_df['mIoU'].max()
             log.info(f"Found previous best mIoU: {best_mIoU:.4f}")
@@ -305,7 +360,10 @@ def main(args):
     for epoch in range(args.start_epoch, args.epochs):
         epoch_start_time = time.time()
         log.info(f"\n===== Epoch {epoch}/{args.epochs - 1} =====")
-        train_stats = train_one_epoch(model, criterion, train_dataLoader, optimizer, epoch, args, log)
+        
+        # --- [MODIFIED] Pass training stage to epoch training function ---
+        # IMPORTANT: You need to modify engine.py to accept this argument!
+        train_stats = train_one_epoch(model, criterion, train_dataLoader, optimizer, epoch, args, log, args.training_stage)
         lr_scheduler.step()
 
         if device.type == 'cuda':
@@ -322,7 +380,8 @@ def main(args):
             model.eval()
             for data in tqdm(test_dl, desc=f"Testing Epoch {epoch}"):
                 x, target = data["image"].to(device), data["label"].cpu().numpy()
-                out = model(x)
+                # --- [MODIFIED] Pass training stage to model evaluation ---
+                out = model(x, stage=args.training_stage)
 
                 prob_map_0_1 = torch.sigmoid(out)
 

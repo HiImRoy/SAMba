@@ -4,52 +4,46 @@ Github: https://github.com/Karl1109
 Email: liuhui@ieee.org
 '''
 
-from typing import Iterable
 import torch
-import time
 from tqdm import tqdm
-import numpy as np
+import util.misc as utils
 
-# --- REVERTED: Removed lr_scheduler and per-batch logic ---
-def train_one_epoch(model: torch.nn.Module, criterion: torch.nn.Module,
-                    data_loader: Iterable, optimizer: torch.optim.Optimizer,
-                    epoch: int, args = None, logger = None):
+# --- MODIFIED: Added 'training_stage' argument and updated logic ---
+def train_one_epoch(model, criterion, data_loader, optimizer, epoch, args, log, training_stage):
     model.train()
     criterion.train()
+    
+    total_loss = 0
+    
+    # TQDM progress bar setup
+    progress_bar = tqdm(data_loader, desc=f"Epoch {epoch} Training")
 
-    epoch_losses = []
-    # The progress bar description is updated to be more informative
-    pbar = tqdm(total=len(data_loader), desc=f"Epoch {epoch} Training")
-    for i, data in enumerate(data_loader):
-        samples = data['image'].to(torch.device(args.device))
-        targets = data['label'].to(torch.device(args.device))
+    for data in progress_bar:
+        samples = data["image"].to(torch.device(args.device))
+        targets = data["label"].to(torch.device(args.device))
 
-        output = model(samples)
-        loss_final = criterion(output, targets.float())
-
-        epoch_losses.append(loss_final.item())
-
-        # Update progress bar with current batch loss
-        pbar.set_description(f"Epoch {epoch} | Batch Loss: {loss_final.item():.4f}")
-        pbar.update(1)
+        # Pass the training stage to the model
+        outputs = model(samples, stage=training_stage)
+        
+        # [FIX] Cast target tensor to float to match model output type
+        loss = criterion(outputs, targets.float())
         
         optimizer.zero_grad()
-        loss_final.backward()
-
-        # Gradient Clipping is kept as a stability improvement
+        loss.backward()
+        
+        # Gradient Clipping
         if args.clip_grad_norm > 0:
             torch.nn.utils.clip_grad_norm_(model.parameters(), args.clip_grad_norm)
-
+            
         optimizer.step()
+        
+        total_loss += loss.item()
+        
+        # Update TQDM description with current average loss
+        progress_bar.set_postfix(loss=f"{total_loss / (progress_bar.n + 1):.4f}")
 
-    pbar.close()
-
-    # Calculate and log average loss for the epoch
-    avg_epoch_loss = np.mean(epoch_losses)
+    avg_loss = total_loss / len(data_loader)
     lr = optimizer.param_groups[0]['lr']
-    cur_time = time.strftime('%Y_%m_%d_%H:%M:%S', time.localtime(time.time()))
-
-    logger.info(f"time -> {cur_time} | Epoch -> {epoch} | Average Train Loss -> {avg_epoch_loss:.4f} | lr -> {lr}")
-
-    # Return stats for logging in main.py
-    return {'loss': avg_epoch_loss}
+    log.info(f"Epoch {epoch} Training - Average Loss: {avg_loss:.4f} | lr: {lr:.6f}")
+    
+    return {"loss": avg_loss}

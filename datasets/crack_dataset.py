@@ -105,8 +105,8 @@ class CrackDataset(BaseDataset):
                 img_pil = TF.hflip(img_pil)
                 lab_pil = TF.hflip(lab_pil)
 
-            # b. 随机颜色抖动 (仅对图像)
-            img_pil = transforms.ColorJitter(brightness=0.3, contrast=0.3, saturation=0.2)(img_pil)
+            # b. 随机颜色抖动 (已禁用)
+            # img_pil = transforms.ColorJitter(brightness=0.3, contrast=0.3, saturation=0.2)(img_pil)
 
             # c. 随机仿射变换 (对图像和标签应用相同的变换)
             affine_params = transforms.RandomAffine.get_params(
