@@ -1,5 +1,5 @@
 '''
-Author: Roy
+Author: Hui Liu
 Github: https://github.com/Karl1109
 Email: liuhui@ieee.org
 '''
@@ -24,12 +24,12 @@ from models.GBC import BottConv
 @BACKBONES.register_module()
 class SAVSS(BaseBackbone):
     arch_zoo = {
-        'Crack': {                  # 缺陷检测的SAVSS参数配置
-            'patch_size': 8,        # 输入图像的分块大小
-            'embed_dims': 256,      # 输入图像的embedding维度(潜空间维度)
-            'num_layers': 4,        # SAVSS的层数
-            'num_convs_patch_embed': 2,  # 块里面的GBC卷积块数
-            'layers_with_dwconv': [],    # 哪些层使用深度可分离卷积
+        'Crack': {
+            'patch_size': 8,
+            'embed_dims': 256,
+            'num_layers': 4,
+            'num_convs_patch_embed': 2,
+            'layers_with_dwconv': [],
             'layer_cfgs': {
                 'use_rms_norm': False,
                 'mamba_cfg': {
@@ -50,13 +50,8 @@ class SAVSS(BaseBackbone):
                  in_channels=3,
                  arch=None,
                  patch_size=16,
-                 # 根据用户要求，将 embed_dims 从 192 修改为 64，以减少参数量。
-                 # 用户的原始请求是修改 dims 参数，但该类中不存在，因此修改 embed_dims。
-                 # 原始请求的 dims 变化趋势(192->64)与此修改一致。
-                 embed_dims=64,
-                 # 根据用户要求，将 num_layers 从 20 修改为 8，以减少参数量。
-                 # 用户的原始请求是修改 depths=(2,2,2,2)，总层数为8。
-                 num_layers=8,
+                 embed_dims=192,
+                 num_layers=20,
                  num_convs_patch_embed=1,
                  with_pos_embed=True,
                  out_indices=-1,
@@ -86,39 +81,35 @@ class SAVSS(BaseBackbone):
             self.num_convs_patch_embed = num_convs_patch_embed
             self.layers_with_dwconv = layers_with_dwconv
             _layer_cfgs = layer_cfgs
-        else:  # 利用字典arch_zoo配置参数
+        else:
             assert self.arch in self.arch_zoo.keys()
             self.embed_dims = self.arch_zoo[self.arch]['embed_dims']
             self.num_layers = self.arch_zoo[self.arch]['num_layers']
             self.patch_size = self.arch_zoo[self.arch]['patch_size']
             self.num_convs_patch_embed = self.arch_zoo[self.arch]['num_convs_patch_embed']
             self.layers_with_dwconv = self.arch_zoo[self.arch]['layers_with_dwconv']
-            _layer_cfgs = self.arch_zoo[selfarch]['layer_cfgs']
+            _layer_cfgs = self.arch_zoo[self.arch]['layer_cfgs']
 
-        self.with_pos_embed = with_pos_embed            # Positional Embedding
-        self.interpolate_mode = interpolate_mode        # 插值方式
-        self.freeze_patch_embed = freeze_patch_embed    # 是否冻结patch_embed
+        self.with_pos_embed = with_pos_embed
+        self.interpolate_mode = interpolate_mode
+        self.freeze_patch_embed = freeze_patch_embed
         _drop_path_rate = drop_path_rate
 
-        self.patch_embed = ConvPatchEmbed(              # 作者从别人那里偷得的代码，实现了Patch Embedding
-            in_channels=in_channels,                    # 输入图像的通道数(3)
-            input_size=img_size,                        # 输入图像大小(224x224)
-            embed_dims=self.embed_dims,                 # 输入图像的embedding维度(潜空间维度)
-            num_convs=self.num_convs_patch_embed,       # 块里面的GBC卷积块数
-            patch_size=self.patch_size,                 # patch大小(8x8)
+        self.patch_embed = ConvPatchEmbed(
+            in_channels=in_channels,
+            input_size=img_size,
+            embed_dims=self.embed_dims,
+            num_convs=self.num_convs_patch_embed,
+            patch_size=self.patch_size,
             stride=self.patch_size
-        )                                               # 总的来说：输入(B,3,224,224) -> 输出(B,28*28,256)  28*28=784个patch，256维潜空间
-        # Patch embedding的输出大小为(B,28*28,256)，即输入图像的embedding维度(潜空间维度)
-        self.patch_resolution = self.patch_embed.init_out_size  # patch的分辨率，计算公式 h_out = (_input_size[0] + 2 * padding[0] - dilation[0] *(kernel_size[0] - 1) - 1) // stride[0] + 1
-        num_patches = self.patch_resolution[0] * self.patch_resolution[1]  # 总的patch数
-
-        # 位置编码
+        )
+        self.patch_resolution = self.patch_embed.init_out_size
+        num_patches = self.patch_resolution[0] * self.patch_resolution[1]
         if with_pos_embed:
-            self.pos_embed = nn.Parameter(torch.zeros(1, num_patches, self.embed_dims)) # 位置编码shape (1,28*28,256),通过广播作用到整个Batch
-            trunc_normal_(self.pos_embed, std=0.02) # 截断正态分布初始化
+            self.pos_embed = nn.Parameter(torch.zeros(1, num_patches, self.embed_dims))
+            trunc_normal_(self.pos_embed, std=0.02)
         self.drop_after_pos = nn.Dropout(p=drop_rate)
 
-        # 指定SAVSS从哪些层（0 <= out_indices[i] <= self.num_layers）输出特征,对FPN和U-Net等结构有用
         if isinstance(out_indices, int):
             out_indices = [out_indices]
         assert isinstance(out_indices, Sequence), \
@@ -126,15 +117,14 @@ class SAVSS(BaseBackbone):
             f'get {type(out_indices)} instead.'
         for i, index in enumerate(out_indices):
             if index < 0:
-                out_indices[i] = self.num_layers + index  # 把负数索引转换为正数索引，比如-1代表最后一层
+                out_indices[i] = self.num_layers + index
             assert 0 <= out_indices[i] <= self.num_layers, \
                 f'Invalid out_indices {index}'
         self.out_indices = out_indices
-        # DropPath：工作原理是在训练过程中随机地“丢弃”（即短路或跳过）整个层或残差块
-        dpr = np.linspace(0, _drop_path_rate, self.num_layers)  # 从底层到顶层的drop_path_rate依次升高，从0开始到drop_path_rate结束
+
+        dpr = np.linspace(0, _drop_path_rate, self.num_layers)
         self.drop_path_rate = _drop_path_rate
 
-        # 设置SAVSS_Layer的参数
         self.layer_cfgs = _layer_cfgs
         self.layers = ModuleList()
         if isinstance(layer_cfgs, dict):
@@ -167,20 +157,15 @@ class SAVSS(BaseBackbone):
                 else:
                     norm_layer = nn.Identity()
                 self.add_module(f'norm_layer{i}', norm_layer)
-        # 配置Down Sample块(就是decoder里配置的瓶颈卷积)，用于在SAVSS块和MFS块之间进行不同尺度特征融合
+
         self.conv256to128 = BottConv(in_channels=256, out_channels=128, mid_channels=32, kernel_size=1, stride=1, padding=0)
         self.conv256to64 = BottConv(in_channels=256, out_channels=64, mid_channels=16, kernel_size=1, stride=1, padding=0)
         self.conv256to32 = BottConv(in_channels=256, out_channels=32, mid_channels=8, kernel_size=1, stride=1, padding=0)
         self.conv256to16 = BottConv(in_channels=256, out_channels=16, mid_channels=4, kernel_size=1, stride=1, padding=0)
-
         self.gn128 = nn.GroupNorm(num_channels=128, num_groups=8)
         self.gn64 = nn.GroupNorm(num_channels=64, num_groups=4)
         self.gn32 = nn.GroupNorm(num_channels=32, num_groups=2)
         self.gn16 = nn.GroupNorm(num_channels=16, num_groups=2)
-
-        # 根据用户要求，添加打印模型总的可训练参数量的代码
-        total_params = sum(p.numel() for p in self.parameters() if p.requires_grad)
-        print(f'SAVSS (after modification): Total trainable parameters: {total_params / 1e6:.2f}M')
 
     @property
     def norm1(self):

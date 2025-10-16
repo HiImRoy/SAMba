@@ -4,8 +4,6 @@
 # This source code is licensed under the license found in the
 # LICENSE file in the root directory of this source tree.
 
-# **重构**: 根据用户“方案一”要求，使用 U-Net 风格解码器替换 MFS，以强化分割细节。
-
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -15,25 +13,16 @@ import os
 from mmcls.models.builder import BACKBONES
 from mmcls.models.utils.embed import PatchEmbed
 
-# --- 从项目根目录进行正确的绝对导入 ---
 from mmcls.SAVSS_dev.models.samba_unet_modules.hiera import Hiera
 from mmcls.SAVSS_dev.models.samba_unet_modules.refiner_adapter import DynamicFeatureFusionRefiner, MLPAdapter
 from mmcls.SAVSS_dev.models.samba_unet_modules.hoacm import HOACM
 from mmcls.SAVSS_dev.models.SAVSS.SAVSS_layer import SAVSS_Layer
 from models.DySample import DySample
 
-# --- 【新增】U-Net 风格解码器模块，用于精细化特征重建 ---
+# --- U-Net 风格解码器模块 (保持不变) ---
 class DecoderBlock(nn.Module):
-    """U-Net 解码器的标准构建块。
-
-    它包含一个上采样层，然后与来自编码器路径的跳跃连接特征进行拼接，
-    最后通过一个卷积块进行处理。
-    """
     def __init__(self, in_channels, skip_channels, out_channels):
         super().__init__()
-        # 上采样层，将深层特征图的尺寸放大两倍
-        self.upsample = nn.Upsample(scale_factor=2, mode='bilinear', align_corners=True)
-        # 卷积块，输入通道数 = 上采样后的通道数 + 跳跃连接的通道数
         self.conv = nn.Sequential(
             nn.Conv2d(in_channels + skip_channels, out_channels, kernel_size=3, padding=1, bias=False),
             nn.BatchNorm2d(out_channels),
@@ -44,72 +33,87 @@ class DecoderBlock(nn.Module):
         )
 
     def forward(self, x, skip):
-        """
-        Args:
-            x (torch.Tensor): 来自更深（下一层）解码器块的特征图。
-            skip (torch.Tensor): 来自编码器/融合器路径的、对应尺度的跳跃连接特征图。
-        """
-        x = self.upsample(x)
-        # 拼接上采样后的特征和跳跃连接特征
+        x = F.interpolate(x, size=skip.shape[-2:], mode='bilinear', align_corners=False)
         x = torch.cat([x, skip], dim=1)
         return self.conv(x)
 
 class UNetDecoder(nn.Module):
-    """U-Net 风格的解码器，使用 DySample 进行高质量上采样。"""
     def __init__(self, decoder_channels):
         super().__init__()
-        # decoder_channels 对应 c1, c2, c3, c4 的维度: [64, 128, 256, 512]
         c1_dim, c2_dim, c3_dim, c4_dim = decoder_channels
-
-        # 解码器从最深层 (c4) 开始，逐级向上融合
         self.block1 = DecoderBlock(in_channels=c4_dim, skip_channels=c3_dim, out_channels=c3_dim)
         self.block2 = DecoderBlock(in_channels=c3_dim, skip_channels=c2_dim, out_channels=c2_dim)
         self.block3 = DecoderBlock(in_channels=c2_dim, skip_channels=c1_dim, out_channels=c1_dim)
 
-        # 【新】使用两个 DySample 模块实现 4x 上采样 (112 -> 224 -> 448)
-        self.dysample_x2 = DySample(c1_dim, scale=2, style='lp', groups=c1_dim)
-        self.dysample_x4 = DySample(c1_dim, scale=2, style='lp', groups=c1_dim)
-
-        # 【新】最终的通道融合卷积层
-        self.final_conv = nn.Conv2d(c1_dim, 1, kernel_size=1)
-
+        # [MODIFIED] Final block to reduce channels before upsampling
+        final_out_channels = 16
+        self.final_block = nn.Sequential(
+            # Reduce channels from c1_dim (96) to 16
+            nn.Conv2d(c1_dim, final_out_channels, kernel_size=3, padding=1, bias=False),
+            nn.BatchNorm2d(final_out_channels),
+            nn.ReLU(inplace=True),
+            # Upsample to original resolution
+            DySample(final_out_channels, scale=2, style='lp', groups=final_out_channels), # 112 -> 224
+            DySample(final_out_channels, scale=2, style='lp', groups=final_out_channels), # 224 -> 448
+            # Final convolution to get logits
+            nn.Conv2d(final_out_channels, 1, kernel_size=1)
+        )
 
     def forward(self, features):
-        """
-        Args:
-            features (tuple): 包含4个尺度特征图的元组 (c4, c3, c2, c1)。
-        """
         c4, c3, c2, c1 = features
-
-        # 解码路径
-        x = self.block1(c4, c3)    # 输出: (B, 256, 28, 28)
-        x = self.block2(x, c2)    # 输出: (B, 128, 56, 56)
-        x = self.block3(x, c1)    # 输出: (B, 64, 112, 112)
-
-        # 【新】使用 DySample 进行高质量上采样
-        x = self.dysample_x2(x)   # 输出: (B, 64, 224, 224)
-        x = self.dysample_x4(x)   # 输出: (B, 64, 448, 448)
-
-        # 【新】应用最终的卷积层生成 logits
-        logits = self.final_conv(x) # 输出: (B, 1, 448, 448)
-
+        x = self.block1(c4, c3)
+        x = self.block2(x, c2)
+        x = self.block3(x, c1)
+        logits = self.final_block(x)
         return logits
 
 logger = logging.getLogger(__name__)
 
+# [NEW] Encapsulate SAVSS stages into a separate module for better profiling
+class SAVSSBackbone(nn.Module):
+    def __init__(self, backbone_dim, savss_depths, savss_drop_path_rate, savss_use_rms_norm, savss_with_dwconv):
+        super().__init__()
+        self.savss_stages = nn.ModuleList()
+        dpr = [x.item() for x in torch.linspace(0, savss_drop_path_rate, sum(savss_depths))]
+        layer_idx = 0
+        for i in range(len(savss_depths)): # Loop through 4 stages
+            stage_layers = nn.ModuleList()
+            for _ in range(savss_depths[i]): # Loop through 2 layers per stage
+                mamba_cfg = {'d_state': 16, 'expand': 2, 'dt_rank': 'auto', 'conv_size': 7}
+                stage_layers.append(SAVSS_Layer(
+                    embed_dims=backbone_dim,
+                    use_rms_norm=savss_use_rms_norm,
+                    with_dwconv=savss_with_dwconv,
+                    drop_path_rate=dpr[layer_idx],
+                    mamba_cfg=mamba_cfg
+                ))
+                layer_idx += 1
+            self.savss_stages.append(stage_layers)
+
+    def forward(self, x_token, hw_shape):
+        backbone_taps = []
+        for stage in self.savss_stages:
+            for layer in stage:
+                x_token = layer(x_token, hw_shape)
+            backbone_taps.append(x_token)
+        return backbone_taps
+
+
 @BACKBONES.register_module()
 class SAMbaCrack(nn.Module):
-    """最终的 SAMbaCrack 模型。"""
-
     def __init__(self, args, **kwargs):
         super().__init__()
 
-        # --- 模型超参数定义 ---
-        sam_dims = [96, 192, 384, 768]
-        savss_dims = [64, 128, 256, 512]
+        # --- [REVISED] 统一的维度配置 --- #
+        neck_dims = [96, 192, 384, 768]
         
+        # --- Hiera (SAM) 分支参数 ---
         hiera_depths = getattr(args, 'hiera_depths', (2, 2, 6, 2))
         hiera_num_heads = getattr(args, 'hiera_num_heads', (3, 6, 12, 24))
+
+        # --- SAVSS 分支参数 ---
+        savss_depths = [2, 2, 2, 2] # 4 stages, 2 layers each
+        backbone_dim = 256
         savss_drop_path_rate = getattr(args, 'savss_drop_path_rate', 0.1)
         savss_use_rms_norm = getattr(args, 'savss_use_rms_norm', True)
         savss_with_dwconv = getattr(args, 'savss_with_dwconv', True)
@@ -117,117 +121,132 @@ class SAMbaCrack(nn.Module):
         # --- 1. Hiera (SAM) 分支 --- #
         self.sam_encoder = Hiera(
             img_size=args.load_height,
-            patch_size=16,
-            embed_dim=sam_dims[0],
+            patch_size=4,
+            embed_dim=neck_dims[0],
             depths=hiera_depths,
             num_heads=hiera_num_heads,
             out_indices=(0, 1, 2, 3)
         )
-        self.refiners = nn.ModuleList([DynamicFeatureFusionRefiner(dim=d) for d in sam_dims])
-        self.adapters = nn.ModuleList([MLPAdapter(dim=d) for d in sam_dims])
-
         for param in self.sam_encoder.parameters():
             param.requires_grad = False
 
-        # --- 2. SAVSS (Mamba) 分支 --- #
+        # --- [RE-INTRODUCED] Adapter and Refiner for SAM features --- #
+        self.refiners = nn.ModuleList([DynamicFeatureFusionRefiner(dim=d) for d in neck_dims])
+        self.adapters = nn.ModuleList([MLPAdapter(dim=d) for d in neck_dims])
+
+        # --- 2. SAVSS 单尺度骨干网络 --- #
         self.savss_patch_embed = PatchEmbed(
             img_size=args.load_height,
             in_channels=3, 
-            embed_dims=savss_dims[0], 
-            conv_cfg={"kernel_size": 4, "stride": 4}
+            embed_dims=backbone_dim, 
+            conv_cfg={"kernel_size": 8, "stride": 8}
         )
-        num_patches = (args.load_height // 4) ** 2
-        self.savss_pos_embed = nn.Parameter(torch.zeros(1, num_patches, savss_dims[0]))
+        num_patches = (args.load_height // 8) ** 2
+        self.savss_pos_embed = nn.Parameter(torch.zeros(1, num_patches, backbone_dim))
         nn.init.trunc_normal_(self.savss_pos_embed, std=0.02)
 
-        self.mamba_encoder = nn.ModuleList()
-        dpr = [x.item() for x in torch.linspace(0, savss_drop_path_rate, sum(hiera_depths))]
+        # [MODIFIED] Instantiate the new SAVSSBackbone module
+        self.savss_backbone_module = SAVSSBackbone(
+            backbone_dim=backbone_dim,
+            savss_depths=savss_depths,
+            savss_drop_path_rate=savss_drop_path_rate,
+            savss_use_rms_norm=savss_use_rms_norm,
+            savss_with_dwconv=savss_with_dwconv
+        )
 
-        for i in range(4):
-            mamba_cfg = {'d_state': 16, 'expand': 2, 'dt_rank': 'auto', 'conv_size': 7}
-            current_dpr = dpr[sum(hiera_depths[:i]):sum(hiera_depths[:i+1])][0]
-            savss_block = SAVSS_Layer(
-                embed_dims=savss_dims[i],
-                use_rms_norm=savss_use_rms_norm,
-                with_dwconv=savss_with_dwconv,
-                drop_path_rate=current_dpr,
-                mamba_cfg=mamba_cfg
+        # --- 3. SAVSS Neck (对齐到 Hiera 原生维度) --- #
+        self.savss_neck = nn.ModuleList([
+            # Proj 1: (256, 56, 56) -> (96, 112, 112)
+            nn.Sequential(
+                nn.Upsample(scale_factor=2, mode='bilinear', align_corners=False),
+                nn.Conv2d(backbone_dim, neck_dims[0], kernel_size=1, bias=False),
+                nn.BatchNorm2d(neck_dims[0])
+            ),
+            # Proj 2: (256, 56, 56) -> (192, 56, 56)
+            nn.Sequential(
+                nn.Conv2d(backbone_dim, neck_dims[1], kernel_size=1, bias=False),
+                nn.BatchNorm2d(neck_dims[1])
+            ),
+            # Proj 3: (256, 56, 56) -> (384, 28, 28)
+            nn.Sequential(
+                nn.MaxPool2d(kernel_size=2, stride=2),
+                nn.Conv2d(backbone_dim, neck_dims[2], kernel_size=1, bias=False),
+                nn.BatchNorm2d(neck_dims[2])
+            ),
+            # Proj 4: (256, 56, 56) -> (768, 14, 14)
+            nn.Sequential(
+                nn.MaxPool2d(kernel_size=4, stride=4),
+                nn.Conv2d(backbone_dim, neck_dims[3], kernel_size=1, bias=False),
+                nn.BatchNorm2d(neck_dims[3])
             )
-            downsample = nn.Sequential(
-                nn.BatchNorm2d(savss_dims[i]),
-                nn.Conv2d(savss_dims[i], savss_dims[i+1], kernel_size=2, stride=2)
-            ) if i < 3 else nn.Identity()
-            self.mamba_encoder.append(nn.ModuleDict({'block': savss_block, 'downsample': downsample}))
-
-        # --- 3. 融合与解码器模块 --- #
-        self.sam_adapters = nn.ModuleList([
-            nn.Conv2d(sam_dims[i], savss_dims[i], kernel_size=1) for i in range(4)
         ])
-        self.hoacms = nn.ModuleList([HOACM(dim=d) for d in savss_dims])
+
+        # --- 4. 融合与解码器模块 --- #
+        self.hoacms = nn.ModuleList([HOACM(dim=d) for d in neck_dims])
+        self.decoder = UNetDecoder(decoder_channels=neck_dims)
+
+    def forward_savss_encoder(self, x):
+        x_token = self.savss_patch_embed(x)
+        x_token = x_token + self.savss_pos_embed
+        B, L, C = x_token.shape
+        H, W = int(L**0.5), int(L**0.5)
+
+        # [MODIFIED] Call the new SAVSSBackbone module
+        backbone_taps = self.savss_backbone_module(x_token, (H, W))
         
-        # **【重构】**: 使用新的 UNetDecoder 替换掉旧的 MFS 解码器。
-        # 这个解码器接收 HOACM 输出的特征维度列表，以构建经典的 U-Net 上采样路径。
-        self.decoder = UNetDecoder(decoder_channels=savss_dims)
+        taps_2d = [tap.transpose(1, 2).reshape(B, C, H, W) for tap in backbone_taps]
 
-    def forward(self, x, stage=2):
-        # --- SAVSS (Mamba) 分支总会运行 ---
-        mamba_features = []
-        mamba_x_token = self.savss_patch_embed(x)
-        mamba_x_token = mamba_x_token + self.savss_pos_embed
-        B, L, C = mamba_x_token.shape
-        H = W = int(L**0.5)
+        mamba_features = [
+            self.savss_neck[0](taps_2d[0]),
+            self.savss_neck[1](taps_2d[1]),
+            self.savss_neck[2](taps_2d[2]),
+            self.savss_neck[3](taps_2d[3]),
+        ]
+        return mamba_features
 
-        for i, mamba_stage in enumerate(self.mamba_encoder):
-            mamba_x_token = mamba_stage['block'](mamba_x_token, (H, W))
-            mamba_x_2d = mamba_x_token.transpose(1, 2).reshape(B, C, H, W)
-            mamba_features.append(mamba_x_2d)
-            
-            if i < len(self.mamba_encoder) - 1:
-                mamba_x_2d_down = mamba_stage['downsample'](mamba_x_2d)
-                B, C, H, W = mamba_x_2d_down.shape
-                mamba_x_token = mamba_x_2d_down.reshape(B, C, -1).transpose(1, 2)
-
-        # --- 根据训练阶段选择数据流 ---
+    def forward(self, x, stage=3):
+        # Stage 1: Only the SAVSS branch runs
         if stage == 1:
-            # 阶段一：直接将 Mamba 特征送入解码器
+            mamba_features = self.forward_savss_encoder(x)
             decoder_input = (mamba_features[3], mamba_features[2], mamba_features[1], mamba_features[0])
-        else: # 默认 stage 2
-            # 阶段二：运行 Hiera 分支并进行融合
-            with torch.no_grad():
-                sam_features = self.sam_encoder(x)
+            logits = self.decoder(decoder_input)
+            return logits
+
+        # Stage 2 & 3: Both branches run for fusion
+        mamba_features = self.forward_savss_encoder(x)
+        with torch.no_grad():
+            sam_native_features = self.sam_encoder(x)
+
+        # Adapt SAM features before fusion
+        sam_features = []
+        for i in range(len(sam_native_features)):
+            adapted = self.adapters[i](sam_native_features[i])
+            refined = self.refiners[i](sam_native_features[i])
+            sam_features.append(adapted + refined)
+
+        # Fuse the aligned features from both pyramids
+        fused_features = []
+        for i in range(4):
+            sam_feat = sam_features[i]
+            mamba_feat = mamba_features[i]
+
+            # [FIX] Defensive check to ensure spatial dimensions match before fusion
+            if sam_feat.shape[-2:] != mamba_feat.shape[-2:]:
+                mamba_feat = F.interpolate(
+                    mamba_feat, 
+                    size=sam_feat.shape[-2:], 
+                    mode='bilinear', 
+                    align_corners=False
+                )
             
-            refined_sam_features = []
-            for i in range(len(sam_features)):
-                sam_feature_detached = sam_features[i].clone().detach()
-                refined = self.refiners[i](sam_feature_detached)
-                adapted = self.adapters[i](sam_feature_detached)
-                refined_sam_features.append(refined + adapted)
-
-            fused_features = []
-            for i in range(4):
-                sam_feat = refined_sam_features[i]
-                mamba_feat = mamba_features[i]
-
-                if sam_feat.shape[-2:] != mamba_feat.shape[-2:]:
-                    sam_feat = F.interpolate(
-                        sam_feat, 
-                        size=mamba_feat.shape[-2:], 
-                        mode='bilinear', 
-                        align_corners=False
-                    )
-                
-                sam_feat_adapted = self.sam_adapters[i](sam_feat)
-                fused = self.hoacms[i](sam_feat_adapted, mamba_feat)
-                fused_features.append(fused)
-            
-            decoder_input = (fused_features[3], fused_features[2], fused_features[1], fused_features[0])
-
-        # --- 解码器接收处理后的特征 ---
+            fused = self.hoacms[i](sam_feat, mamba_feat)
+            fused_features.append(fused)
+        
+        decoder_input = (fused_features[3], fused_features[2], fused_features[1], fused_features[0])
         logits = self.decoder(decoder_input)
         return logits
 
     def init_weights(self, pretrained=None):
-        """初始化权重，特别是加载 Hiera 编码器的预训练权重。"""
         if pretrained is None:
             logger.info("没有提供预训练权重。从头开始初始化 Hiera。")
             return
@@ -237,25 +256,8 @@ class SAMbaCrack(nn.Module):
                 state_dict = torch.load(pretrained, map_location='cpu')
                 if 'model' in state_dict:
                     state_dict = state_dict['model']
-
                 missing_keys, unexpected_keys = self.sam_encoder.load_state_dict(state_dict, strict=False)
-
-                num_missing = len(missing_keys)
-                num_unexpected = len(unexpected_keys)
-                num_sam_encoder_params = len(self.sam_encoder.state_dict().keys())
-                num_loaded_into_sam_encoder = num_sam_encoder_params - num_missing
-
-                logger.info("--- SAM2 预训练权重加载摘要 ---")
-                logger.info(f"  总计 {num_sam_encoder_params} 个 Hiera 编码器参数。")
-                logger.info(f"  成功加载 {num_loaded_into_sam_encoder} 个参数。")
-                
-                if num_missing > 0:
-                    logger.warning(f"  缺少 {num_missing} 个参数。")
-                if num_unexpected > 0:
-                    logger.warning(f"  有 {num_unexpected} 个意外的参数。")
-                
-                logger.info("--- 摘要结束 ---")
-                logger.info("Hiera 编码器参数已被冻结，不会参与训练。")
+                logger.info(f"Hiera 权重加载完毕. Missing: {len(missing_keys)}, Unexpected: {len(unexpected_keys)}.")
             except Exception as e:
                 logger.error(f"加载预训练权重时出错: {e}")
         else:

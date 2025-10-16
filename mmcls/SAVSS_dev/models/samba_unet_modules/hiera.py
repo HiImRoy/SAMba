@@ -62,8 +62,8 @@ class Hiera(nn.Module):
 
     def __init__(
         self,
-        img_size=224,
-        patch_size=16,
+        img_size=448,
+        patch_size=4,
         in_chans=3,
         embed_dim=96,
         depths=(2, 2, 6, 2),

@@ -33,72 +33,52 @@ def log_parameter_summary(model, log, args):
 
     # --- 1. FLOPs Calculation ---
     try:
-        # Create a dummy input tensor with the correct size and device
         dummy_input = torch.randn(1, 3, args.load_height, args.load_width).to(next(model.parameters()).device)
-        flops, params = profile(model, inputs=(dummy_input, args.training_stage))
+        # Use verbose=False to prevent thop from printing to stdout
+        flops, _ = profile(model, inputs=(dummy_input, args.training_stage), verbose=False)
         log.info(f"FLOPs: {flops / 1e9:.2f} G")
     except Exception as e:
         log.warning(f"Could not calculate FLOPs: {e}")
 
-    # --- 2. Parameter Count ---
+    # --- 2. Modular Parameter Breakdown ---
+    log.info("-" * 60)
+    log.info(f"{'Module':<25} | {'Parameters (M)':>15} | {'Trainable':>10}")
+    log.info("-" * 60)
+
+    # Iterate through top-level modules
+    for name, module in model.named_children():
+        module_params = sum(p.numel() for p in module.parameters())
+        if module_params == 0:
+            continue
+        module_trainable_params = sum(p.numel() for p in module.parameters() if p.requires_grad)
+        is_trainable = "Yes" if module_trainable_params > 0 else "No"
+        log.info(f"{name:<25} | {module_params / 1e6:>15.2f} | {is_trainable:>10}")
+
+    # Account for parameters that are direct attributes of the model (not in a child module)
+    child_params_ids = set(id(p) for m in model.children() for p in m.parameters())
+    standalone_params = [p for p in model.parameters() if id(p) not in child_params_ids]
+    if standalone_params:
+        num_standalone = sum(p.numel() for p in standalone_params)
+        num_standalone_trainable = sum(p.numel() for p in standalone_params if p.requires_grad)
+        is_trainable = "Yes" if num_standalone_trainable > 0 else "No"
+        log.info(f"{'model_level_params':<25} | {num_standalone / 1e6:>15.2f} | {is_trainable:>10}")
+
+    log.info("-" * 60)
+
+    # --- 3. Overall Summary ---
     total_params = sum(p.numel() for p in model.parameters())
     trainable_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
-    log.info(f"Params: {total_params / 1e6:.2f} M")
+    log.info(f"Total Params: {total_params / 1e6:.2f} M")
     log.info(f"Trainable Params: {trainable_params / 1e6:.2f} M")
     if total_params > 0:
         log.info(f"Trainable Ratio: {trainable_params / total_params * 100:.2f}%")
 
-    # --- 3. Model Size ---
-    param_size = 0
-    for param in model.parameters():
-        param_size += param.nelement() * param.element_size()
-    buffer_size = 0
-    for buffer in model.buffers():
-        buffer_size += buffer.nelement() * buffer.element_size()
+    # --- 4. Model Size ---
+    param_size = sum(p.numel() * p.element_size() for p in model.parameters())
+    buffer_size = sum(b.numel() * b.element_size() for b in model.buffers())
     model_size_mb = (param_size + buffer_size) / 1024**2
     log.info(f"Model Size: {model_size_mb:.2f} MB")
-    log.info("---------------------")
-
-    # --- 4. Detailed Breakdown (for SAMbaCrack) ---
-    if args.model_name == 'SAMbaCrack':
-        log.info("--- Detailed Parameter Breakdown (SAMbaCrack) ---")
-        if hasattr(model, 'savss_patch_embed') and hasattr(model, 'savss_pos_embed'):
-            savss_input_total = sum(p.numel() for p in model.savss_patch_embed.parameters()) + model.savss_pos_embed.numel()
-            savss_input_trainable = sum(p.numel() for p in model.savss_patch_embed.parameters() if p.requires_grad) + (model.savss_pos_embed.numel() if model.savss_pos_embed.requires_grad else 0)
-            
-            trainable_percentage = 0
-            if savss_input_total > 0:
-                trainable_percentage = (savss_input_trainable / savss_input_total) * 100
-
-            log.info(f"  - SAVSS Input (PatchEmbed + PosEmbed):")
-            log.info(f"    - Total params: {savss_input_total / 1e6:.3f}M")
-            log.info(f"    - Trainable params: {savss_input_trainable / 1e6:.3f}M ({trainable_percentage:.2f}%)")
-
-        module_map = {
-            "SAM Encoder (Frozen)": "sam_encoder",
-            "SAM Refiners": "refiners",
-            "SAM MLP Adapters": "adapters",
-            "SAM Downscale Adapters": "sam_adapters",
-            "SAVSS Encoder (Mamba)": "mamba_encoder",
-            "Fusion (HOACM)": "hoacms",
-            "Decoder": "decoder"
-        }
-
-        for name, attr_name in module_map.items():
-            if hasattr(model, attr_name):
-                module = getattr(model, attr_name)
-                module_total = sum(p.numel() for p in module.parameters())
-                module_trainable = sum(p.numel() for p in module.parameters() if p.requires_grad)
-
-                trainable_percentage = 0
-                if module_total > 0:
-                    trainable_percentage = (module_trainable / module_total) * 100
-
-                log.info(f"  - {name}:")
-                log.info(f"    - Total params: {module_total / 1e6:.3f}M")
-                log.info(f"    - Trainable params: {module_trainable / 1e6:.3f}M ({trainable_percentage:.2f}%)")
-
-        log.info("----------------------------------------------------\n")
+    log.info("-" * 60)
 
 def save_plots(log_df, output_dir):
     """Generates and saves plots for loss and metrics."""
@@ -161,53 +141,85 @@ def save_best_masks(model, device, args, output_dir, best_threshold):
             cv2.imwrite(str(output_dir / root_name), stitched_image)
 
 def get_args_parser():
+    """
+    功能: 定义和解析命令行参数。
+    此函数使用argparse库来管理模型训练和评估所需的所有超参数。
+    """
     parser = argparse.ArgumentParser('SAMBA FOR CRACK', add_help=False)
-    parser.add_argument('--model_name', default='SAMbaCrack', type=str)
-    parser.add_argument('--pretrained_weights', type=str, default='sam2_checkpoints/sam2.1_hiera_base_plus.pt', help='Path to the pretrained Hiera weights.')
 
-    # --- Two-Stage Training Arguments ---
-    parser.add_argument('--training_stage', default=1, type=int, choices=[1, 2], help="Set training stage: 1 for Mamba+Decoder, 2 for full model fine-tuning.")
-    parser.add_argument('--stage1_weights', type=str, default='', help='Path to stage 1 checkpoint, required for starting stage 2.')
+    # ------------------- 模型与权重参数 (Model & Weights) -------------------
+    parser.add_argument('--model_name', default='SAMbaCrack', type=str,
+                        help="要使用的模型名称。例如: 'SAMbaCrack'。")
+    parser.add_argument('--pretrained_weights', type=str, default='sam2_checkpoints/sam2.1_hiera_base_plus.pt',
+                        help="预训练的Hiera骨干网络权重路径, 用于初始化模型。")
 
-    parser.add_argument('--BCELoss_ratio', default=0.83, type=float, help="Weight for BCE Loss in the total loss function.")
-    parser.add_argument('--DiceLoss_ratio', default=0.17, type=float, help="Weight for Dice Loss in the total loss function.")
+    # ------------------- 训练策略参数 (Training Strategy) -------------------
+    parser.add_argument('--training_stage', default=3, type=int, choices=[1, 2, 3],
+                        help="设置训练阶段: [1] 仅训练SAVSS分支和解码器; [2] 训练融合模块和SAVSS分支; [3] 训练整个可训练模型。")
+    parser.add_argument('--stage1_weights', type=str, default='',
+                        help="阶段2训练时必须提供, 指向阶段1训练好的模型权重路径。")
+    parser.add_argument('--stage2_weights', type=str, default='',
+                        help="阶段3训练时必须提供, 指向阶段2训练好的模型权重路径。")
 
-    parser.add_argument('--Norm_Type', default='GN', type=str)
-    parser.add_argument('--dataset_path', default="data/CFD")
-    parser.add_argument('--batch_size_train', type=int, default=8)
-    parser.add_argument('--batch_size_test', type=int, default=8)
+    # ------------------- 损失函数参数 (Loss Function) -------------------
+    parser.add_argument('--BCELoss_ratio', default=0.83, type=float,
+                        help="BCE损失在总损失中的权重。")
+    parser.add_argument('--DiceLoss_ratio', default=0.17, type=float,
+                        help="Dice损失在总损失中的权重。")
 
-    parser.add_argument('--lr_scheduler', type=str, default='PolyLR', help='LR scheduler to use.')
-    parser.add_argument('--lr', default=1e-4, type=float, help="The initial learning rate for PolyLR.")
+    # ------------------- 优化器与学习率调度器 (Optimizer & LR Scheduler) -------------------
+    parser.add_argument('--lr_scheduler', type=str, default='PolyLR',
+                        help="学习率调度器类型, 推荐使用 'PolyLR'。")
+    parser.add_argument('--lr', default=1e-4, type=float,
+                        help="初始学习率。")
+    parser.add_argument('--min_lr', default=1e-6, type=float,
+                        help="学习率的下限。")
+    parser.add_argument('--weight_decay', default=0.01, type=float,
+                        help="AdamW优化器的权重衰减系数。")
+    parser.add_argument('--clip_grad_norm', default=1.0, type=float,
+                        help="梯度裁剪的范数阈值 (0表示不使用)。")
+    parser.add_argument('--lr_backbone_multiplier', default=0.1, type=float,
+                        help="应用于微调模块的学习率乘数。")
 
-    parser.add_argument('--clip_grad_norm', default=1.0, type=float, help="Gradient clipping norm value (0 for no clipping).")
+    # ------------------- 数据集与数据加载 (Dataset & Dataloader) -------------------
+    parser.add_argument('--dataset_path', default="data/CFD", type=str,
+                        help="数据集的根目录。")
+    parser.add_argument('--dataset_mode', type=str, default='crack',
+                        help="数据集模式。")
+    parser.add_argument('--batch_size_train', type=int, default=1,
+                        help="训练时的批处理大小。")
+    parser.add_argument('--batch_size_test', type=int, default=1,
+                        help="测试/验证时的批处理大小。")
+    parser.add_argument('--load_width', type=int, default=448,
+                        help="图像加载宽度。")
+    parser.add_argument('--load_height', type=int, default=448,
+                        help="图像加载高度。")
+    parser.add_argument('--num_threads', default=1, type=int,
+                        help="数据加载线程数。")
+    parser.add_argument('--serial_batches', action='store_true',
+                        help="串行处理批次。")
 
-    parser.add_argument('--lr_backbone_multiplier', default=0.1, type=float, help="Multiplier for the learning rate of fine-tuned parts (e.g., SAM adapters).")
+    # ------------------- 运行与环境参数 (Execution & Environment) -------------------
+    parser.add_argument('--epochs', default=100, type=int,
+                        help="总训练周期数。")
+    parser.add_argument('--start_epoch', default=0, type=int,
+                        help="起始训练周期。")
+    parser.add_argument('--resume', default='', type=str,
+                        help="从checkpoint恢复训练的路径。")
+    parser.add_argument('--output_dir', default='./results/samba_v16',
+                        help="输出根目录。")
+    parser.add_argument('--device', default='cuda',
+                        help="训练设备。")
+    parser.add_argument('--seed', default=42, type=int,
+                        help="随机种子。")
+    parser.add_argument('--phase', type=str, default='train',
+                        help="运行阶段, 'train' 或 'test'。")
 
-    parser.add_argument('--min_lr', default=1e-6, type=float)
-    parser.add_argument('--weight_decay', default=0.01, type=float)
-    parser.add_argument('--epochs', default=100, type=int)
-    parser.add_argument('--start_epoch', default=0, type=int)
-
-    parser.add_argument('--resume', default='', type=str, help='Path to checkpoint to resume training from.')
-
-    parser.add_argument('--lr_drop', default=30, type=int)
-    parser.add_argument('--sgd', action='store_true')
-    parser.add_argument('--output_dir', default='./results/samba_v11', help='Root directory for all outputs')
-    parser.add_argument('--device', default='cuda')
-    parser.add_argument('--seed', default=42, type=int)
-    parser.add_argument('--dataset_mode', type=str, default='crack')
-    parser.add_argument('--serial_batches', action='store_true')
-    parser.add_argument('--num_threads', default=1, type=int)
-    parser.add_argument('--phase', type=str, default='train')
-    parser.add_argument('--load_width', type=int, default=448)
-    parser.add_argument('--load_height', type=int, default=448)
     return parser
 
 def main(args):
-    # --- [MODIFIED] Set up stage-specific output directory ---
+    # --- 设置输出目录 ---
     if args.resume:
-        # Infer base experiment directory from resume path
         stage_dir = Path(args.resume).parent.parent
         exp_dir = stage_dir.parent
     else:
@@ -216,13 +228,10 @@ def main(args):
         exp_name = f"{cur_time}_{args.model_name}_{dataset_name}"
         exp_dir = Path(args.output_dir) / exp_name
 
-    # Define stage-specific sub-directory
     output_dir = exp_dir / f'stage{args.training_stage}'
-
     weights_dir = output_dir / 'weights'
     masks_dir = output_dir / 'best_epoch_masks'
     plots_dir = output_dir / 'plots'
-
     output_dir.mkdir(parents=True, exist_ok=True)
     weights_dir.mkdir(exist_ok=True)
     masks_dir.mkdir(exist_ok=True)
@@ -250,53 +259,54 @@ def main(args):
     model, criterion = build_model(args)
     model.to(device)
 
-    # Load Hiera backbone weights if not resuming and path is provided
     if not args.resume and args.pretrained_weights:
         log.info(f"Initializing Hiera backbone weights...")
         model.init_weights(args.pretrained_weights)
 
-    # --- [NEW] Load Stage 1 weights if starting Stage 2 ---
     if args.training_stage == 2 and args.stage1_weights:
         if os.path.isfile(args.stage1_weights):
             log.info(f"--- Loading Stage 1 weights from: {args.stage1_weights} ---")
             checkpoint = torch.load(args.stage1_weights, map_location='cpu')
-            # Load with strict=False, as fusion modules are not in the stage 1 checkpoint
             missing_keys, unexpected_keys = model.load_state_dict(checkpoint['model'], strict=False)
-            log.info(f"Stage 1 weights loaded. Missing keys: {len(missing_keys)}, Unexpected keys: {len(unexpected_keys)}")
+            log.info(f"Stage 1 weights loaded. Missing: {len(missing_keys)}, Unexpected: {len(unexpected_keys)}")
         else:
-            log.warning(f"Stage 1 checkpoint not found at {args.stage1_weights}. Fusion modules will be trained from scratch.")
+            log.warning(f"Stage 1 checkpoint not found at {args.stage1_weights}.")
 
-    # --- [NEW] Setup Optimizer based on Training Stage ---
+    if args.training_stage == 3 and args.stage2_weights:
+        if os.path.isfile(args.stage2_weights):
+            log.info(f"--- Loading Stage 2 weights from: {args.stage2_weights} ---")
+            checkpoint = torch.load(args.stage2_weights, map_location='cpu')
+            missing_keys, unexpected_keys = model.load_state_dict(checkpoint['model'], strict=False)
+            log.info(f"Stage 2 weights loaded. Missing: {len(missing_keys)}, Unexpected: {len(unexpected_keys)}")
+        else:
+            log.warning(f"Stage 2 checkpoint not found at {args.stage2_weights}.")
+
+    # --- [REFACTORED] Optimizer Setup ---
     param_dicts = []
     if args.training_stage == 1:
         log.info("--- Optimizer Setup: STAGE 1 ---")
-        log.info("Training: Mamba Encoder + Decoder")
-        # Freeze all parameters first
+        log.info("Training: SAVSS branch + Decoder")
         for param in model.parameters():
             param.requires_grad = False
-        # Unfreeze Mamba and Decoder parts
-        trainable_modules = [model.savss_patch_embed, model.mamba_encoder, model.decoder]
+        # Unfreeze only the SAVSS branch and the final decoder
+        trainable_modules = [model.savss_patch_embed, model.savss_backbone, model.savss_neck, model.decoder]
         for module in trainable_modules:
             for param in module.parameters():
                 param.requires_grad = True
         model.savss_pos_embed.requires_grad = True
-        
         params_to_train = [p for p in model.parameters() if p.requires_grad]
         param_dicts = [{"params": params_to_train, "lr": args.lr}]
-        log.info(f"Number of trainable parameters in Stage 1: {sum(p.numel() for p in params_to_train)}")
 
-    else: # Stage 2
+    elif args.training_stage == 2:
         log.info("--- Optimizer Setup: STAGE 2 ---")
-        log.info("Training: Fusion Modules (from scratch) + Fine-tuning Mamba/Decoder")
-        # Freeze all parameters first
+        log.info("Training: Adapters, Refiners, Fusion (HOACM) + Fine-tuning SAVSS/Decoder")
         for param in model.parameters():
             param.requires_grad = False
+        # Train fusion layers from scratch
+        scratch_modules = [model.adapters, model.refiners, model.hoacms]
+        # Fine-tune the rest
+        finetune_modules = [model.savss_patch_embed, model.savss_backbone, model.savss_neck, model.decoder]
         
-        # Define modules to train from scratch and modules to fine-tune
-        scratch_modules = [model.refiners, model.adapters, model.sam_adapters, model.hoacms]
-        finetune_modules = [model.savss_patch_embed, model.mamba_encoder, model.decoder]
-
-        # Unfreeze and collect parameters
         scratch_params = []
         for module in scratch_modules:
             for param in module.parameters():
@@ -315,8 +325,19 @@ def main(args):
             {"params": scratch_params, "lr": args.lr},
             {"params": finetune_params, "lr": args.lr * args.lr_backbone_multiplier},
         ]
-        log.info(f"Number of scratch parameters: {sum(p.numel() for p in scratch_params)}")
-        log.info(f"Number of fine-tuning parameters: {sum(p.numel() for p in finetune_params)}")
+        
+    elif args.training_stage == 3:
+        log.info("--- Optimizer Setup: STAGE 3 (Train Entire Model) ---")
+        log.info("Training all trainable parts of the model with a single learning rate.")
+        # Unfreeze all trainable parts of the model
+        for param in model.parameters():
+            # Keep the sam_encoder frozen, unfreeze everything else
+            param.requires_grad = True
+        for param in model.sam_encoder.parameters():
+            param.requires_grad = False
+
+        params_to_train = [p for p in model.parameters() if p.requires_grad]
+        param_dicts = [{"params": params_to_train, "lr": args.lr}]
 
     optimizer = torch.optim.AdamW(param_dicts, lr=args.lr, weight_decay=args.weight_decay)
     lr_scheduler = PolyLR(optimizer, eta_min=args.min_lr, begin=args.start_epoch, end=args.epochs)
@@ -361,8 +382,6 @@ def main(args):
         epoch_start_time = time.time()
         log.info(f"\n===== Epoch {epoch}/{args.epochs - 1} =====")
         
-        # --- [MODIFIED] Pass training stage to epoch training function ---
-        # IMPORTANT: You need to modify engine.py to accept this argument!
         train_stats = train_one_epoch(model, criterion, train_dataLoader, optimizer, epoch, args, log, args.training_stage)
         lr_scheduler.step()
 
@@ -380,7 +399,6 @@ def main(args):
             model.eval()
             for data in tqdm(test_dl, desc=f"Testing Epoch {epoch}"):
                 x, target = data["image"].to(device), data["label"].cpu().numpy()
-                # --- [MODIFIED] Pass training stage to model evaluation ---
                 out = model(x, stage=args.training_stage)
 
                 prob_map_0_1 = torch.sigmoid(out)

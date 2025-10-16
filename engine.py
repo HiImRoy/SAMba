@@ -8,7 +8,7 @@ import torch
 from tqdm import tqdm
 import util.misc as utils
 
-# --- MODIFIED: Added 'training_stage' argument and updated logic ---
+# --- [RESTORED] Added back 'training_stage' argument ---
 def train_one_epoch(model, criterion, data_loader, optimizer, epoch, args, log, training_stage):
     model.train()
     criterion.train()
@@ -25,7 +25,6 @@ def train_one_epoch(model, criterion, data_loader, optimizer, epoch, args, log, 
         # Pass the training stage to the model
         outputs = model(samples, stage=training_stage)
         
-        # [FIX] Cast target tensor to float to match model output type
         loss = criterion(outputs, targets.float())
         
         optimizer.zero_grad()

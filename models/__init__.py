@@ -14,7 +14,6 @@ if project_root not in sys.path:
 import torch
 from models.decoder import bce_dice
 from mmcls.SAVSS_dev.models.SAVSS.SAMbaCrack import SAMbaCrack
-from models.unet_baseline import UNetBaseline
 
 def build_model(args):
     """
