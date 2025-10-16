@@ -186,9 +186,9 @@ def get_args_parser():
                         help="数据集的根目录。")
     parser.add_argument('--dataset_mode', type=str, default='crack',
                         help="数据集模式。")
-    parser.add_argument('--batch_size_train', type=int, default=1,
+    parser.add_argument('--batch_size_train', type=int, default=2,
                         help="训练时的批处理大小。")
-    parser.add_argument('--batch_size_test', type=int, default=1,
+    parser.add_argument('--batch_size_test', type=int, default=2,
                         help="测试/验证时的批处理大小。")
     parser.add_argument('--load_width', type=int, default=448,
                         help="图像加载宽度。")
@@ -200,13 +200,13 @@ def get_args_parser():
                         help="串行处理批次。")
 
     # ------------------- 运行与环境参数 (Execution & Environment) -------------------
-    parser.add_argument('--epochs', default=100, type=int,
+    parser.add_argument('--epochs', default=150, type=int,
                         help="总训练周期数。")
     parser.add_argument('--start_epoch', default=0, type=int,
                         help="起始训练周期。")
     parser.add_argument('--resume', default='', type=str,
                         help="从checkpoint恢复训练的路径。")
-    parser.add_argument('--output_dir', default='./results/samba_v16',
+    parser.add_argument('--output_dir', default='./results/samba_v17',
                         help="输出根目录。")
     parser.add_argument('--device', default='cuda',
                         help="训练设备。")

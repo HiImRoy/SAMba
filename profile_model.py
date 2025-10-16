@@ -28,7 +28,7 @@ def get_args_parser():
 
     # --- Dummy args to satisfy model constructor ---
     parser.add_argument('--hiera_depths', default=(2, 2, 6, 2), nargs='+', help="Depths for Hiera stages.")
-    parser.add_argument('--hiera_num_heads', default=(3, 6, 12, 24), nargs='+', help="Num heads for Hiera stages.")
+    parser.add_argument('--hiera_num_heads', default=(2, 4, 8, 16), nargs='+', help="Num heads for Hiera stages.")
     parser.add_argument('--savss_drop_path_rate', default=0.1, type=float)
     parser.add_argument('--savss_use_rms_norm', default=True, type=bool)
     parser.add_argument('--savss_with_dwconv', default=True, type=bool)

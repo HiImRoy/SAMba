@@ -1,3 +1,6 @@
+# Author: Roy
+# Copyright (c) Roy. All rights reserved.
+
 # --- ROBUST IMPORT FIX: Manually add project root to sys.path ---
 import sys
 import os
@@ -12,28 +15,22 @@ if project_root not in sys.path:
 """Model factory."""
 
 import torch
+# [Roy] 从新的decoder.py中导入损失函数
 from models.decoder import bce_dice
+# [Roy] 导入主模型
 from mmcls.SAVSS_dev.models.SAVSS.SAMbaCrack import SAMbaCrack
 
 def build_model(args):
     """
-    Builds the model and criterion based on the provided arguments.
-    This function now supports switching between SAMbaCrack and UNetBaseline.
+    功能: 根据传入的参数构建SAMbaCrack模型和损失函数。
+    [Roy] 移除了对旧模型(如UNetBaseline)的支持，现在只构建SAMbaCrack。
     """
     device = torch.device(args.device)
-    model = None
 
-    # --- Build model based on model_name ---
-    if args.model_name == 'UNetBaseline':
-        model = UNetBaseline(n_channels=3, n_classes=1)
-        # Quick check of parameter count
-        print(f"--- Built UNetBaseline model with ~{sum(p.numel() for p in model.parameters() if p.requires_grad) / 1e6:.2f}M parameters. ---")
-    elif args.model_name == 'SAMbaCrack':
-        model = SAMbaCrack(args=args)
-    else:
-        raise ValueError(f"Model '{args.model_name}' not recognized.")
+    # [Roy] 直接实例化SAMbaCrack模型，不再需要根据model_name判断
+    model = SAMbaCrack(args=args)
 
-    # The loss function is defined in decoder.py, which we can reuse.
+    # 损失函数在decoder.py中定义
     criterion = bce_dice(args)
     criterion.to(device)
 
