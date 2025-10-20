@@ -5,21 +5,55 @@
 # LICENSE file in the root directory of this source tree.
 
 # **重构**: 根据用户“方案一”要求，使用 U-Net 风格解码器替换 MFS，以强化分割细节。
+# **重构**: 使用 Sequential Adapter 替换 LoRA，实现更清晰的参数高效微调。
+# **修正**: 修正了 Adapter 的 forward 签名以匹配 HieraBlock。
+# **重构**: 使用 FCM 模块替换 HOACM 模块作为特征融合器。
+# **修正**: 修复了 Hiera 模型中 Adapter 注入的错误路径。
 
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
 import logging
 import os
+import math
 
 from mmcls.models.builder import BACKBONES
 from mmcls.models.utils.embed import PatchEmbed
 
 # --- 从项目根目录进行正确的绝对导入 ---
-from mmcls.SAVSS_dev.models.samba_unet_modules.hiera import Hiera
-from mmcls.SAVSS_dev.models.samba_unet_modules.refiner_adapter import DynamicFeatureFusionRefiner, MLPAdapter
-from mmcls.SAVSS_dev.models.samba_unet_modules.hoacm import HOACM
+from mmcls.SAVSS_dev.models.samba_unet_modules.hiera import Hiera, HieraBlock
+from models.fcm import FCM
 from mmcls.SAVSS_dev.models.SAVSS.SAVSS_layer import SAVSS_Layer
+
+
+# --- 【重构】使用 Sequential Adapter 进行微调 ---
+class Adapter(nn.Module):
+    def __init__(self, blk) -> None:
+        super(Adapter, self).__init__()
+        self.block = blk
+        # 【修正】HieraBlock中的注意力是nn.MultiheadAttention，没有.qkv属性。
+        # 通过其norm层的normalized_shape来安全地获取维度信息。
+        dim = blk.norm1.normalized_shape[0]
+        self.prompt_learn = nn.Sequential(
+            nn.Linear(dim, 32),  # Bottleneck dimension of 32
+            nn.GELU(),
+            nn.Linear(32, dim),
+            nn.GELU()
+        )
+
+    def forward(self, x):
+        """
+        Adapter 的前向传播逻辑。
+        【修正】HieraBlock 的 forward 只需要 x 作为输入。
+        """
+        # 1. 基于输入 x 生成一个 prompt
+        prompt = self.prompt_learn(x)
+        # 2. 将 prompt 添加到原始输入上
+        promped_x = x + prompt
+        # 3. 将增强后的输入传递给原始的、被冻结的 block
+        net = self.block(promped_x)
+        return net
+
 
 # --- 【新增】U-Net 风格解码器模块，用于精细化特征重建 ---
 class DecoderBlock(nn.Module):
@@ -104,9 +138,10 @@ class SAMbaCrack(nn.Module):
         # --- 模型超参数定义 ---
         sam_dims = [96, 192, 384, 768]
         savss_dims = [64, 128, 256, 512]
-        
-        hiera_depths = getattr(args, 'hiera_depths', (2, 2, 6, 2))
-        hiera_num_heads = getattr(args, 'hiera_num_heads', (3, 6, 12, 24))
+
+        # 参考SAM2 UNet的设置
+        hiera_depths = getattr(args, 'hiera_depths', (2, 6, 36, 4))
+        hiera_num_heads = getattr(args, 'hiera_num_heads', (2, 2, 2, 2))
         savss_drop_path_rate = getattr(args, 'savss_drop_path_rate', 0.1)
         savss_use_rms_norm = getattr(args, 'savss_use_rms_norm', True)
         savss_with_dwconv = getattr(args, 'savss_with_dwconv', True)
@@ -120,11 +155,24 @@ class SAMbaCrack(nn.Module):
             num_heads=hiera_num_heads,
             out_indices=(0, 1, 2, 3)
         )
-        self.refiners = nn.ModuleList([DynamicFeatureFusionRefiner(dim=d) for d in sam_dims])
-        self.adapters = nn.ModuleList([MLPAdapter(dim=d) for d in sam_dims])
-
+        
+        # --- 【重构】应用 Sequential Adapter ---
+        # 首先，冻结所有 SAM Encoder 的参数
         for param in self.sam_encoder.parameters():
             param.requires_grad = False
+
+        # 【修正】然后，根据正确的 Hiera 结构，将每个 HieraBlock 替换为 Adapter 包裹的块
+        for level in self.sam_encoder.levels:
+            # 每个 level 是一个 ModuleDict，其 'blocks' 键对应一个 nn.Sequential 容器
+            sequential_blocks = level['blocks']
+            for i in range(len(sequential_blocks)):
+                # 将 Sequential 容器中的 HieraBlock 替换为 Adapter(HieraBlock)
+                sequential_blocks[i] = Adapter(sequential_blocks[i])
+        
+        # 打印可训练参数数量以供验证
+        trainable_params = sum(p.numel() for p in self.parameters() if p.requires_grad)
+        logger.info(f"SAMbaCrack with Sequential Adapter enabled. Trainable parameters: {trainable_params/1e6:.2f}M")
+
 
         # --- 2. SAVSS (Mamba) 分支 --- #
         self.savss_patch_embed = PatchEmbed(
@@ -160,22 +208,15 @@ class SAMbaCrack(nn.Module):
         self.sam_adapters = nn.ModuleList([
             nn.Conv2d(sam_dims[i], savss_dims[i], kernel_size=1) for i in range(4)
         ])
-        self.hoacms = nn.ModuleList([HOACM(dim=d) for d in savss_dims])
+        # 【重构】使用 FCM 替换 HOACM
+        self.fcms = nn.ModuleList([FCM(dim=d) for d in savss_dims])
         
         # **【重构】**: 使用新的 UNetDecoder 替换掉旧的 MFS 解码器。
-        # 这个解码器接收 HOACM 输出的特征维度列表，以构建经典的 U-Net 上采样路径。
         self.decoder = UNetDecoder(decoder_channels=savss_dims)
 
     def forward(self, x):
-        with torch.no_grad():
-            sam_features = self.sam_encoder(x)
-        
-        refined_sam_features = []
-        for i in range(len(sam_features)):
-            sam_feature_detached = sam_features[i].clone().detach()
-            refined = self.refiners[i](sam_feature_detached)
-            adapted = self.adapters[i](sam_feature_detached)
-            refined_sam_features.append(refined + adapted)
+        # Hiera Encoder 现在通过 Adapter 模块进行微调，前向传播调用保持不变
+        sam_features = self.sam_encoder(x)
 
         mamba_features = []
         mamba_x_token = self.savss_patch_embed(x)
@@ -195,7 +236,7 @@ class SAMbaCrack(nn.Module):
 
         fused_features = []
         for i in range(4):
-            sam_feat = refined_sam_features[i]
+            sam_feat = sam_features[i]
             mamba_feat = mamba_features[i]
 
             if sam_feat.shape[-2:] != mamba_feat.shape[-2:]:
@@ -207,10 +248,11 @@ class SAMbaCrack(nn.Module):
                 )
             
             sam_feat_adapted = self.sam_adapters[i](sam_feat)
-            fused = self.hoacms[i](sam_feat_adapted, mamba_feat)
+            # 【重构】调用 FCM 模块
+            fused = self.fcms[i](sam_feat_adapted, mamba_feat)
             fused_features.append(fused)
 
-        # **【重构】**: 将融合后的特征按 (c4, c3, c2, c1) 顺序送入新的 U-Net 解码器。
+        # 将融合后的特征按 (c4, c3, c2, c1) 顺序送入新的 U-Net 解码器。
         decoder_input = (fused_features[3], fused_features[2], fused_features[1], fused_features[0])
         logits = self.decoder(decoder_input, final_size=x.shape[-2:])
 
@@ -228,24 +270,26 @@ class SAMbaCrack(nn.Module):
                 if 'model' in state_dict:
                     state_dict = state_dict['model']
 
+                # 加载权重时，由于我们将 HieraBlock 替换为了 Adapter(HieraBlock)，
+                # 预训练模型中不存在 Adapter 的参数 (prompt_learn)，所以我们设置 strict=False。
                 missing_keys, unexpected_keys = self.sam_encoder.load_state_dict(state_dict, strict=False)
 
-                num_missing = len(missing_keys)
-                num_unexpected = len(unexpected_keys)
-                num_sam_encoder_params = len(self.sam_encoder.state_dict().keys())
-                num_loaded_into_sam_encoder = num_sam_encoder_params - num_missing
-
-                logger.info("--- SAM2 预训练权重加载摘要 ---")
-                logger.info(f"  总计 {num_sam_encoder_params} 个 Hiera 编码器参数。")
-                logger.info(f"  成功加载 {num_loaded_into_sam_encoder} 个参数。")
+                # 过滤掉我们预期会缺失的 Adapter 参数，只报告非预期的缺失
+                missing_keys_non_adapter = [k for k in missing_keys if 'prompt_learn' not in k]
                 
+                num_missing = len(missing_keys_non_adapter)
+                num_unexpected = len(unexpected_keys)
+                
+                logger.info("--- SAM2 预训练权重加载摘要 (Adapter enabled) ---")
                 if num_missing > 0:
-                    logger.warning(f"  缺少 {num_missing} 个参数。")
+                    logger.warning(f"  警告: 缺少 {num_missing} 个非 Adapter 参数。")
                 if num_unexpected > 0:
-                    logger.warning(f"  有 {num_unexpected} 个意外的参数。")
+                    logger.warning(f"  警告: 有 {num_unexpected} 个意外的参数。")
+                if num_missing == 0 and num_unexpected == 0:
+                    logger.info("  所有非 Adapter 参数均已成功加载。")
                 
                 logger.info("--- 摘要结束 ---")
-                logger.info("Hiera 编码器参数已被冻结，不会参与训练。")
+                logger.info("Hiera 编码器原始参数已被冻结，只有 Adapter 参数会参与训练。")
             except Exception as e:
                 logger.error(f"加载预训练权重时出错: {e}")
         else:
