@@ -201,13 +201,13 @@ def get_args_parser():
 
     # --- 3. 数据集与加载设置 (Dataset & Dataloader Settings) ---
     group = parser.add_argument_group('数据集与加载设置 (Dataset & Dataloader Settings)')
-    group.add_argument('--dataset_path', default="data/DeepCrack", type=str,
+    group.add_argument('--dataset_path', default="data/Crack500", type=str,
                        help="数据集所在的根目录。")
     group.add_argument('--dataset_mode', type=str, default='crack',
                        help="要使用的数据集模式（例如 'crack'）。")
-    group.add_argument('--batch_size_train', type=int, default=16,
+    group.add_argument('--batch_size_train', type=int, default=10,
                        help="训练时的批量大小。")
-    group.add_argument('--batch_size_test', type=int, default=16,
+    group.add_argument('--batch_size_test', type=int, default=10,
                        help="测试/评估时的批量大小。")
     group.add_argument('--load_width', type=int, default=448,
                        help="加载图像时统一调整到的宽度。")

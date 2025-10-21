@@ -136,12 +136,15 @@ class SAMbaCrack(nn.Module):
         super().__init__()
 
         # --- 模型超参数定义 ---
-        sam_dims = [96, 192, 384, 768]
+        # 主干维度
+        sam_dims = [112, 224, 448, 896]  # base+ SAM2.1权重
         savss_dims = [64, 128, 256, 512]
+        # 颈部维度，可独立于主干进行修改
+        fcm_dims = [64, 64, 64, 64]
 
-        # 参考SAM2 UNet的设置
-        hiera_depths = getattr(args, 'hiera_depths', (2, 6, 36, 4))
-        hiera_num_heads = getattr(args, 'hiera_num_heads', (2, 2, 2, 2))
+        # SAM2 Base的设置
+        hiera_depths = getattr(args, 'hiera_depths', (2, 3, 16, 3))
+        hiera_num_heads = getattr(args, 'hiera_num_heads', (2, 4, 8, 16))
         savss_drop_path_rate = getattr(args, 'savss_drop_path_rate', 0.1)
         savss_use_rms_norm = getattr(args, 'savss_use_rms_norm', True)
         savss_with_dwconv = getattr(args, 'savss_with_dwconv', True)
@@ -149,7 +152,7 @@ class SAMbaCrack(nn.Module):
         # --- 1. Hiera (SAM) 分支 --- #
         self.sam_encoder = Hiera(
             img_size=args.load_height,
-            patch_size=16,
+            patch_size=8,
             embed_dim=sam_dims[0],
             depths=hiera_depths,
             num_heads=hiera_num_heads,
@@ -204,15 +207,17 @@ class SAMbaCrack(nn.Module):
             ) if i < 3 else nn.Identity()
             self.mamba_encoder.append(nn.ModuleDict({'block': savss_block, 'downsample': downsample}))
 
-        # --- 3. 融合与解码器模块 --- #
+        # --- 3. 融合与解码器模块 (颈部) --- #
         self.sam_adapters = nn.ModuleList([
-            nn.Conv2d(sam_dims[i], savss_dims[i], kernel_size=1) for i in range(4)
+            nn.Conv2d(sam_dims[i], fcm_dims[i], kernel_size=1) for i in range(4)
         ])
-        # 【重构】使用 FCM 替换 HOACM
-        self.fcms = nn.ModuleList([FCM(dim=d) for d in savss_dims])
+        self.mamba_adapters = nn.ModuleList([
+            nn.Conv2d(savss_dims[i], fcm_dims[i], kernel_size=1) for i in range(4)
+        ])
+        self.fcms = nn.ModuleList([FCM(dim=d) for d in fcm_dims])
         
-        # **【重构】**: 使用新的 UNetDecoder 替换掉旧的 MFS 解码器。
-        self.decoder = UNetDecoder(decoder_channels=savss_dims)
+        # **【重构】**: 解码器现在使用颈部维度 fcm_dims
+        self.decoder = UNetDecoder(decoder_channels=fcm_dims)
 
     def forward(self, x):
         # Hiera Encoder 现在通过 Adapter 模块进行微调，前向传播调用保持不变
@@ -239,6 +244,7 @@ class SAMbaCrack(nn.Module):
             sam_feat = sam_features[i]
             mamba_feat = mamba_features[i]
 
+            # 空间维度对齐: 将 sam_feat 上采样以匹配 mamba_feat 的空间分辨率
             if sam_feat.shape[-2:] != mamba_feat.shape[-2:]:
                 sam_feat = F.interpolate(
                     sam_feat, 
@@ -247,9 +253,12 @@ class SAMbaCrack(nn.Module):
                     align_corners=False
                 )
             
+            # 通道维度对齐: 将两个主干的特征都投影到统一的颈部维度 (fcm_dims)
             sam_feat_adapted = self.sam_adapters[i](sam_feat)
-            # 【重构】调用 FCM 模块
-            fused = self.fcms[i](sam_feat_adapted, mamba_feat)
+            mamba_feat_adapted = self.mamba_adapters[i](mamba_feat)
+
+            # 调用 FCM 模块进行融合
+            fused = self.fcms[i](sam_feat_adapted, mamba_feat_adapted)
             fused_features.append(fused)
 
         # 将融合后的特征按 (c4, c3, c2, c1) 顺序送入新的 U-Net 解码器。
