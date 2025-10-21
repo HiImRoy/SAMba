@@ -281,8 +281,11 @@ class SAVSS_Layer(nn.Module):
         self.SAVSS_2D = SAVSS_2D(**mamba_cfg)
         self.drop_path = build_dropout(dict(type='DropPath', drop_prob=drop_path_rate))
         
-        # 2D 卷积模块 (num_groups=8)
-        self.GBC_C = GBC(embed_dims, num_groups=8)
+        # 【修改】GBC 模块数量固定为 2
+        self.gbc_blocks = nn.Sequential(
+            GBC(embed_dims, num_groups=8),
+            GBC(embed_dims, num_groups=8)
+        )
         # 2D 融合模块
         self.PAF = PAF(embed_dims, embed_dims // 2)
 
@@ -302,7 +305,7 @@ class SAVSS_Layer(nn.Module):
 
         # --- 并行分支 2: GBC -> Mamba 路径 ---
         # 1. GBC 路径 (2D 卷积): 提取局部空间特征
-        x_2d_gbc = self.GBC_C(x_2d) # Shape: [B, C, H, W]
+        x_2d_gbc = self.gbc_blocks(x_2d) # Shape: [B, C, H, W]
         # 2. 变形 (2D -> 1D): 将 GBC 的输出压平为 1D 序列，为 Mamba 做准备
         x_gbc_token = x_2d_gbc.permute(0, 2, 3, 1).reshape(B, L, C) # Shape: [B, L, C]
         # 3. Mamba 路径 (1D 序列处理): 提取长距离依赖
