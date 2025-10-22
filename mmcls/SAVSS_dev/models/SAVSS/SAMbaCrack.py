@@ -94,7 +94,7 @@ class SAMbaCrack(nn.Module):
         self.sam_dims = [112, 224, 448, 896]
         self.hiera_depths = getattr(args, 'hiera_depths', (2, 3, 16, 3))
         self.hiera_num_heads = getattr(args, 'hiera_num_heads', (2, 4, 8, 16))
-        self.sam_patch_size = 8
+        self.sam_patch_size = 4
 
         # 2. Mamba (MambaVision) 分支参数
         self.mamba_variant = getattr(args, 'mamba_variant', 'T')
