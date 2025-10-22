@@ -244,13 +244,13 @@ def get_args_parser():
                        help="数据集所在的根目录。")
     group.add_argument('--dataset_mode', type=str, default='crack',
                        help="要使用的数据集模式（例如 'crack'）。")
-    group.add_argument('--batch_size_train', type=int, default=8,
+    group.add_argument('--batch_size_train', type=int, default=16,
                        help="训练时的批量大小。")
-    group.add_argument('--batch_size_test', type=int, default=8,
+    group.add_argument('--batch_size_test', type=int, default=16,
                        help="测试/评估时的批量大小。")
-    group.add_argument('--load_width', type=int, default=448,
+    group.add_argument('--load_width', type=int, default=256,
                        help="加载图像时统一调整到的宽度。")
-    group.add_argument('--load_height', type=int, default=448,
+    group.add_argument('--load_height', type=int, default=256,
                        help="加载图像时统一调整到的高度。")
     group.add_argument('--num_threads', default=1, type=int,
                        help="数据加载时使用的工作线程数。")
@@ -259,7 +259,7 @@ def get_args_parser():
 
     # --- 4. 训练超参数 (Training Hyperparameters) ---
     group = parser.add_argument_group('训练超参数 (Training Hyperparameters)')
-    group.add_argument('--epochs', default=100, type=int,
+    group.add_argument('--epochs', default=150, type=int,
                        help="总训练轮次。")
     group.add_argument('--start_epoch', default=0, type=int,
                        help="起始训练轮次，在恢复训练时会自动设置。")

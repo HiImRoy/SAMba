@@ -13,7 +13,7 @@ from .utils import MaskToTensor
 
 class CrackDataset(BaseDataset):
     """
-    一个用于裂缝数据集的类，现在包含了动态的80/20分割和针对训练集的数据增强。
+    一个用于裂缝数据集的类，现在包含了动态的90/10分割和针对训练集的数据增强。
     """
 
     def __init__(self, args):
@@ -39,18 +39,18 @@ class CrackDataset(BaseDataset):
         all_img_paths = sorted(make_dataset(img_dir))
         random.Random(args.seed).shuffle(all_img_paths)
 
-        # --- 3. 计算80%的分割点 ---
-        split_idx = int(len(all_img_paths) * 0.8)
+        # --- 3. 计算90%的分割点 ---
+        split_idx = int(len(all_img_paths) * 0.9)
         if len(all_img_paths) == 0:
             raise ValueError(f"在 {img_dir} 中未找到任何图像。")
 
         # --- 4. 根据当前阶段分配路径切片 ---
         if args.phase == 'train':
             self.img_paths = all_img_paths[:split_idx]
-            print(f"数据集: 使用 {len(self.img_paths)} 张图像进行训练 (总数的80%)。")
+            print(f"数据集: 使用 {len(self.img_paths)} 张图像进行训练 (总数的90%)。")
         elif args.phase == 'test':
             self.img_paths = all_img_paths[split_idx:]
-            print(f"数据集: 使用 {len(self.img_paths)} 张图像进行验证 (总数的20%)。")
+            print(f"数据集: 使用 {len(self.img_paths)} 张图像进行验证 (总数的10%)。")
         else:
             self.img_paths = all_img_paths
 

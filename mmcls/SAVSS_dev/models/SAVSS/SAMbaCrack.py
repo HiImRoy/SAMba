@@ -104,11 +104,11 @@ class SAMbaCrack(nn.Module):
         mamba_pretrained_weights = getattr(args, 'mamba_pretrained_weights', '')
 
         # 3. Neck (FCM) & Decoder 参数
-        self.fcm_dims = [64, 128, 256,512]
+        self.fcm_dims = [64, 128, 256, 512]
 
         # --- [新增] 动态计算 MambaVision 的输出维度 ---
         # MambaVision 不同变体的初始维度
-        variant_dims = {'T': 80, 'S': 96, 'B': 128, 'L': 196}
+        variant_dims = {'T': 64, 'S': 96, 'B': 128, 'L': 196}
         mamba_base_dim = variant_dims[self.mamba_variant.upper()]
         # [FIX] 更新 mamba_dims 以反映现在使用的是下采样前的特征
         # 这些维度是每个 MambaVisionStage 的输入维度

@@ -508,7 +508,7 @@ def create_mamba_vision_backbone(variant='B', pretrained=False, pretrained_path=
     """
     # 不同模型变体的配置
     model_configs = {
-        'T': {'depths': [1, 3, 8, 4], 'num_heads': [2, 4, 8, 16], 'dim': 80, 'in_dim': 32},
+        'T': {'depths': [1, 3, 8, 4], 'num_heads': [2, 4, 8, 16], 'dim': 64, 'in_dim': 32},
         'S': {'depths': [3, 3, 7, 5], 'num_heads': [2, 4, 8, 16], 'dim': 96, 'in_dim': 64},
         'B': {'depths': [3, 3, 10, 5], 'num_heads': [2, 4, 8, 16], 'dim': 128, 'in_dim': 64, 'layer_scale': 1e-5},
         'L': {'depths': [3, 3, 10, 5], 'num_heads': [4, 8, 16, 32], 'dim': 196, 'in_dim': 64, 'layer_scale': 1e-5},
