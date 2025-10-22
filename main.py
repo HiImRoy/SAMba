@@ -194,9 +194,9 @@ def get_args_parser():
 
     # --- 2. 损失函数设置 (Loss Function Settings) ---
     group = parser.add_argument_group('损失函数设置 (Loss Function Settings)')
-    group.add_argument('--BCELoss_ratio', default=0.83, type=float,
+    group.add_argument('--BCELoss_ratio', default=0.87, type=float,
                        help="总损失中二元交叉熵损失（BCE Loss）的权重。")
-    group.add_argument('--DiceLoss_ratio', default=0.17, type=float,
+    group.add_argument('--DiceLoss_ratio', default=0.13, type=float,
                        help="总损失中 Dice 损失的权重。")
 
     # --- 3. 数据集与加载设置 (Dataset & Dataloader Settings) ---
@@ -278,14 +278,16 @@ def main(args):
         exp_name = f"{cur_time}_{args.model_name}_{dataset_name}"
         output_dir = Path(args.output_dir) / exp_name
 
-    # 创建权重、蒙版和图表子目录
+    # 创建权重、蒙版、图表和原始预测子目录
     weights_dir = output_dir / 'weights'
     masks_dir = output_dir / 'best_epoch_masks'
     plots_dir = output_dir / 'plots'
+    raw_preds_base_dir = output_dir / 'raw_predictions_by_epoch' # 新增：用于存放所有 epoch 的原始预测图
     output_dir.mkdir(parents=True, exist_ok=True)
     weights_dir.mkdir(exist_ok=True)
     masks_dir.mkdir(exist_ok=True)
     plots_dir.mkdir(exist_ok=True)
+    raw_preds_base_dir.mkdir(exist_ok=True) # 新增：创建原始预测图的父目录
 
     # 初始化日志记录器
     log = get_logger(output_dir, 'experiment_log')
@@ -318,6 +320,21 @@ def main(args):
 
     # 打印模型的详细参数信息
     log_parameter_summary(model, log, args)
+
+    # 记录 SAMbaCrack 的特定模型超参数
+    if args.model_name == 'SAMbaCrack':
+        log.info("--- SAMbaCrack 模型内部超参数 ---")
+        try:
+            log.info(f"sam_dims: {model.sam_dims}")
+            log.info(f"savss_dims: {model.savss_dims}")
+            log.info(f"hiera_depths: {model.hiera_depths}")
+            log.info(f"hiera_num_heads: {model.hiera_num_heads}")
+            log.info(f"hiera_patch_size: {model.hiera_patch_size}")
+            log.info(f"savss_patch_size: {model.savss_patch_size}")
+            log.info(f"fcm_output_dims: {model.fcm_output_dims}")
+        except AttributeError as e:
+            log.warning(f"无法记录部分模型超参数，因为模型实例上缺少该属性: {e}")
+        log.info("------------------------------------\n")
 
     # --- 4. 创建数据加载器 ---
     args.phase = 'train'
@@ -398,7 +415,8 @@ def main(args):
             torch.cuda.reset_peak_memory_stats(0)
 
         # --- 7b. 在验证集上进行评估 ---
-        temp_eval_dir = output_dir / f'epoch_{epoch}_raw_preds'
+        # 修改：将每个 epoch 的原始预测图保存到 raw_preds_base_dir 下的子文件夹
+        temp_eval_dir = raw_preds_base_dir / f'epoch_{epoch}' 
         temp_eval_dir.mkdir(exist_ok=True)
 
         args.phase = 'test'

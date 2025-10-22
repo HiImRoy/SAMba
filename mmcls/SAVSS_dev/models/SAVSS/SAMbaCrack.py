@@ -136,23 +136,43 @@ class SAMbaCrack(nn.Module):
         super().__init__()
 
         # --- 模型超参数定义 ---
-        sam_dims = [96, 192, 384, 768]
-        savss_dims = [64, 128, 256, 512]
+        # model #Channels #Blocks #Heads FLOPs Param
+        # Hiera-T [96-192-384-768] [1-2-7-2] [1-2-4-8] 5G 28M
+        # Hiera-S [96-192-384-768] [1-2-11-2] [1-2-4-8] 6G 35M
+        # Hiera-B [96-192-384-768] [2-3-16-3] [1-2-4-8] 9G 52M
 
-        # 参考SAM2 UNet的设置
-        hiera_depths = getattr(args, 'hiera_depths', (2, 6, 36, 4))
-        hiera_num_heads = getattr(args, 'hiera_num_heads', (2, 2, 2, 2))
+        # Hiera-B+ [112-224-448-896] [2-3-16-3] [2-4-8-16] 13G 70M
+
+        # Hiera-L [144-288-576-1152] [2-6-36-4] [2-4-8-16] 40G 214M
+        # Hiera-H [256-512-1024-2048] [2-6-36-4] [4-8-16-32] 125G 673M
+
+        # 正儿八经但是效果不好的超参数
+        self.sam_dims = [112, 224, 448, 896]
+        self.savss_dims = [64, 128, 256, 512]
+        self.hiera_depths = getattr(args, 'hiera_depths', (2, 3, 16, 3))
+
+        # 莫名其妙但是就是效果好的超参数
+        # self.sam_dims = [96, 192, 384, 768]
+        # self.savss_dims = [64, 128, 256, 512]
+        # self.hiera_depths = getattr(args, 'hiera_depths', (2, 2, 6, 2))
+
+        self.hiera_num_heads = getattr(args, 'hiera_num_heads', (2, 4, 8, 16))
         savss_drop_path_rate = getattr(args, 'savss_drop_path_rate', 0.1)
         savss_use_rms_norm = getattr(args, 'savss_use_rms_norm', True)
         savss_with_dwconv = getattr(args, 'savss_with_dwconv', True)
 
+        # Add patch sizes and fcm output dims as attributes
+        self.hiera_patch_size = 16 # from Hiera init
+        self.savss_patch_size = 4 # from PatchEmbed init (conv_cfg={"kernel_size": 4, "stride": 4})
+        self.fcm_output_dims = self.savss_dims # FCM output dims are savss_dims
+
         # --- 1. Hiera (SAM) 分支 --- #
         self.sam_encoder = Hiera(
             img_size=args.load_height,
-            patch_size=16,
-            embed_dim=sam_dims[0],
-            depths=hiera_depths,
-            num_heads=hiera_num_heads,
+            patch_size=self.hiera_patch_size,
+            embed_dim=self.sam_dims[0],
+            depths=self.hiera_depths,
+            num_heads=self.hiera_num_heads,
             out_indices=(0, 1, 2, 3)
         )
         
@@ -178,41 +198,41 @@ class SAMbaCrack(nn.Module):
         self.savss_patch_embed = PatchEmbed(
             img_size=args.load_height,
             in_channels=3, 
-            embed_dims=savss_dims[0], 
-            conv_cfg={"kernel_size": 4, "stride": 4}
+            embed_dims=self.savss_dims[0], 
+            conv_cfg={"kernel_size": self.savss_patch_size, "stride": self.savss_patch_size}
         )
-        num_patches = (args.load_height // 4) ** 2
-        self.savss_pos_embed = nn.Parameter(torch.zeros(1, num_patches, savss_dims[0]))
+        num_patches = (args.load_height // self.savss_patch_size) ** 2
+        self.savss_pos_embed = nn.Parameter(torch.zeros(1, num_patches, self.savss_dims[0]))
         nn.init.trunc_normal_(self.savss_pos_embed, std=0.02)
 
         self.mamba_encoder = nn.ModuleList()
-        dpr = [x.item() for x in torch.linspace(0, savss_drop_path_rate, sum(hiera_depths))]
+        dpr = [x.item() for x in torch.linspace(0, savss_drop_path_rate, sum(self.hiera_depths))]
 
         for i in range(4):
             mamba_cfg = {'d_state': 16, 'expand': 2, 'dt_rank': 'auto', 'conv_size': 7}
-            current_dpr = dpr[sum(hiera_depths[:i]):sum(hiera_depths[:i+1])][0]
+            current_dpr = dpr[sum(self.hiera_depths[:i]):sum(self.hiera_depths[:i+1])][0]
             savss_block = SAVSS_Layer(
-                embed_dims=savss_dims[i],
+                embed_dims=self.savss_dims[i],
                 use_rms_norm=savss_use_rms_norm,
                 with_dwconv=savss_with_dwconv,
                 drop_path_rate=current_dpr,
                 mamba_cfg=mamba_cfg
             )
             downsample = nn.Sequential(
-                nn.BatchNorm2d(savss_dims[i]),
-                nn.Conv2d(savss_dims[i], savss_dims[i+1], kernel_size=2, stride=2)
+                nn.BatchNorm2d(self.savss_dims[i]),
+                nn.Conv2d(self.savss_dims[i], self.savss_dims[i+1], kernel_size=2, stride=2)
             ) if i < 3 else nn.Identity()
             self.mamba_encoder.append(nn.ModuleDict({'block': savss_block, 'downsample': downsample}))
 
         # --- 3. 融合与解码器模块 --- #
         self.sam_adapters = nn.ModuleList([
-            nn.Conv2d(sam_dims[i], savss_dims[i], kernel_size=1) for i in range(4)
+            nn.Conv2d(self.sam_dims[i], self.savss_dims[i], kernel_size=1) for i in range(4)
         ])
         # 【重构】使用 FCM 替换 HOACM
-        self.fcms = nn.ModuleList([FCM(dim=d) for d in savss_dims])
+        self.fcms = nn.ModuleList([FCM(dim=d) for d in self.savss_dims])
         
         # **【重构】**: 使用新的 UNetDecoder 替换掉旧的 MFS 解码器。
-        self.decoder = UNetDecoder(decoder_channels=savss_dims)
+        self.decoder = UNetDecoder(decoder_channels=self.savss_dims)
 
     def forward(self, x):
         # Hiera Encoder 现在通过 Adapter 模块进行微调，前向传播调用保持不变
