@@ -328,6 +328,7 @@ def main(args):
             log.info(f"sam_dims: {model.sam_dims}")
             log.info(f"savss_dims: {model.savss_dims}")
             log.info(f"hiera_depths: {model.hiera_depths}")
+            log.info(f"savss_depths: {model.savss_depths}") # 新增行
             log.info(f"hiera_num_heads: {model.hiera_num_heads}")
             log.info(f"hiera_patch_size: {model.hiera_patch_size}")
             log.info(f"savss_patch_size: {model.savss_patch_size}")

@@ -9,6 +9,7 @@
 # **修正**: 修正了 Adapter 的 forward 签名以匹配 HieraBlock。
 # **重构**: 使用 FCM 模块替换 HOACM 模块作为特征融合器。
 # **修正**: 修复了 Hiera 模型中 Adapter 注入的错误路径。
+# **增强**: 增加了 savss_depths 超参数，允许控制每个 SAVSS 阶段的层数。
 
 import torch
 import torch.nn as nn
@@ -146,17 +147,19 @@ class SAMbaCrack(nn.Module):
         # Hiera-L [144-288-576-1152] [2-6-36-4] [2-4-8-16] 40G 214M
         # Hiera-H [256-512-1024-2048] [2-6-36-4] [4-8-16-32] 125G 673M
 
-        # 正儿八经但是效果不好的超参数
-        self.sam_dims = [112, 224, 448, 896]
-        self.savss_dims = [64, 128, 256, 512]
-        self.hiera_depths = getattr(args, 'hiera_depths', (2, 3, 16, 3))
-
-        # 莫名其妙但是就是效果好的超参数
-        # self.sam_dims = [96, 192, 384, 768]
+        # # 正儿八经但是效果不好的超参数
+        # self.sam_dims = [112, 224, 448, 896]
         # self.savss_dims = [64, 128, 256, 512]
-        # self.hiera_depths = getattr(args, 'hiera_depths', (2, 2, 6, 2))
+        # self.hiera_depths = getattr(args, 'hiera_depths', (2, 3, 16, 3))
+        # self.savss_depths = getattr(args, 'savss_depths', (2, 2, 2, 2))
+        # self.hiera_num_heads = getattr(args, 'hiera_num_heads', (2, 4, 8, 16))
+        # 莫名其妙但是就是效果好的超参数
+        self.savss_depths = getattr(args, 'savss_depths', (1, 1, 1, 1))
+        self.savss_dims = [64, 128, 256, 512]
+        self.sam_dims = [96, 192, 384, 768]
+        self.hiera_depths = getattr(args, 'hiera_depths', (2, 2, 6, 2))
+        self.hiera_num_heads = getattr(args, 'hiera_num_heads', (3, 6, 12, 24))
 
-        self.hiera_num_heads = getattr(args, 'hiera_num_heads', (2, 4, 8, 16))
         savss_drop_path_rate = getattr(args, 'savss_drop_path_rate', 0.1)
         savss_use_rms_norm = getattr(args, 'savss_use_rms_norm', True)
         savss_with_dwconv = getattr(args, 'savss_with_dwconv', True)
@@ -177,19 +180,13 @@ class SAMbaCrack(nn.Module):
         )
         
         # --- 【重构】应用 Sequential Adapter ---
-        # 首先，冻结所有 SAM Encoder 的参数
         for param in self.sam_encoder.parameters():
             param.requires_grad = False
-
-        # 【修正】然后，根据正确的 Hiera 结构，将每个 HieraBlock 替换为 Adapter 包裹的块
         for level in self.sam_encoder.levels:
-            # 每个 level 是一个 ModuleDict，其 'blocks' 键对应一个 nn.Sequential 容器
             sequential_blocks = level['blocks']
             for i in range(len(sequential_blocks)):
-                # 将 Sequential 容器中的 HieraBlock 替换为 Adapter(HieraBlock)
                 sequential_blocks[i] = Adapter(sequential_blocks[i])
         
-        # 打印可训练参数数量以供验证
         trainable_params = sum(p.numel() for p in self.parameters() if p.requires_grad)
         logger.info(f"SAMbaCrack with Sequential Adapter enabled. Trainable parameters: {trainable_params/1e6:.2f}M")
 
@@ -205,37 +202,47 @@ class SAMbaCrack(nn.Module):
         self.savss_pos_embed = nn.Parameter(torch.zeros(1, num_patches, self.savss_dims[0]))
         nn.init.trunc_normal_(self.savss_pos_embed, std=0.02)
 
+        # **【重构】** 根据 savss_depths 构建 Mamba 编码器
         self.mamba_encoder = nn.ModuleList()
-        dpr = [x.item() for x in torch.linspace(0, savss_drop_path_rate, sum(self.hiera_depths))]
+        # **【修正】** dpr 的总长度应为所有 SAVSS 层的总和
+        dpr = [x.item() for x in torch.linspace(0, savss_drop_path_rate, sum(self.savss_depths))]
+        dpr_idx = 0
 
-        for i in range(4):
+        for i in range(4): # 4个阶段
             mamba_cfg = {'d_state': 16, 'expand': 2, 'dt_rank': 'auto', 'conv_size': 7}
-            current_dpr = dpr[sum(self.hiera_depths[:i]):sum(self.hiera_depths[:i+1])][0]
-            savss_block = SAVSS_Layer(
-                embed_dims=self.savss_dims[i],
-                use_rms_norm=savss_use_rms_norm,
-                with_dwconv=savss_with_dwconv,
-                drop_path_rate=current_dpr,
-                mamba_cfg=mamba_cfg
-            )
+            
+            # 为当前阶段创建多个 SAVSS_Layer
+            stage_blocks = nn.ModuleList()
+            for _ in range(self.savss_depths[i]):
+                savss_block = SAVSS_Layer(
+                    embed_dims=self.savss_dims[i],
+                    use_rms_norm=savss_use_rms_norm,
+                    with_dwconv=savss_with_dwconv,
+                    drop_path_rate=dpr[dpr_idx],
+                    mamba_cfg=mamba_cfg
+                )
+                stage_blocks.append(savss_block)
+                dpr_idx += 1
+
+            # 下采样模块
             downsample = nn.Sequential(
                 nn.BatchNorm2d(self.savss_dims[i]),
                 nn.Conv2d(self.savss_dims[i], self.savss_dims[i+1], kernel_size=2, stride=2)
             ) if i < 3 else nn.Identity()
-            self.mamba_encoder.append(nn.ModuleDict({'block': savss_block, 'downsample': downsample}))
+            
+            self.mamba_encoder.append(nn.ModuleDict({
+                'blocks': stage_blocks, 
+                'downsample': downsample
+            }))
 
         # --- 3. 融合与解码器模块 --- #
         self.sam_adapters = nn.ModuleList([
             nn.Conv2d(self.sam_dims[i], self.savss_dims[i], kernel_size=1) for i in range(4)
         ])
-        # 【重构】使用 FCM 替换 HOACM
         self.fcms = nn.ModuleList([FCM(dim=d) for d in self.savss_dims])
-        
-        # **【重构】**: 使用新的 UNetDecoder 替换掉旧的 MFS 解码器。
         self.decoder = UNetDecoder(decoder_channels=self.savss_dims)
 
     def forward(self, x):
-        # Hiera Encoder 现在通过 Adapter 模块进行微调，前向传播调用保持不变
         sam_features = self.sam_encoder(x)
 
         mamba_features = []
@@ -244,11 +251,17 @@ class SAMbaCrack(nn.Module):
         B, L, C = mamba_x_token.shape
         H = W = int(L**0.5)
 
+        # **【重构】** 适配多层 SAVSS_Layer 的前向传播
         for i, stage in enumerate(self.mamba_encoder):
-            mamba_x_token = stage['block'](mamba_x_token, (H, W))
+            # 依次通过当前阶段的所有 SAVSS_Layer
+            for block in stage['blocks']:
+                mamba_x_token = block(mamba_x_token, (H, W))
+            
+            # 将阶段输出转换为 2D 特征图并保存
             mamba_x_2d = mamba_x_token.transpose(1, 2).reshape(B, C, H, W)
             mamba_features.append(mamba_x_2d)
             
+            # 如果不是最后一个阶段，则进行下采样
             if i < len(self.mamba_encoder) - 1:
                 mamba_x_2d_down = stage['downsample'](mamba_x_2d)
                 B, C, H, W = mamba_x_2d_down.shape
@@ -268,11 +281,9 @@ class SAMbaCrack(nn.Module):
                 )
             
             sam_feat_adapted = self.sam_adapters[i](sam_feat)
-            # 【重构】调用 FCM 模块
             fused = self.fcms[i](sam_feat_adapted, mamba_feat)
             fused_features.append(fused)
 
-        # 将融合后的特征按 (c4, c3, c2, c1) 顺序送入新的 U-Net 解码器。
         decoder_input = (fused_features[3], fused_features[2], fused_features[1], fused_features[0])
         logits = self.decoder(decoder_input, final_size=x.shape[-2:])
 
@@ -290,11 +301,8 @@ class SAMbaCrack(nn.Module):
                 if 'model' in state_dict:
                     state_dict = state_dict['model']
 
-                # 加载权重时，由于我们将 HieraBlock 替换为了 Adapter(HieraBlock)，
-                # 预训练模型中不存在 Adapter 的参数 (prompt_learn)，所以我们设置 strict=False。
                 missing_keys, unexpected_keys = self.sam_encoder.load_state_dict(state_dict, strict=False)
 
-                # 过滤掉我们预期会缺失的 Adapter 参数，只报告非预期的缺失
                 missing_keys_non_adapter = [k for k in missing_keys if 'prompt_learn' not in k]
                 
                 num_missing = len(missing_keys_non_adapter)
