@@ -2,8 +2,7 @@
 #
 # This source code is licensed under the license found in the
 # LICENSE file in the root directory of this source tree.
-# REFACTOR: Removed unused Decoder class, build function, and SAVSS/MFS imports
-# to eliminate the mmcv dependency.
+# REFACTOR: This file was created by refactoring from the old decoder.py
 
 import torch
 from torch import nn

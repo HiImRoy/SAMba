@@ -31,166 +31,115 @@ from thop import profile
 
 def log_parameter_summary(model, log, args):
     """
-    记录并打印模型的详细参数摘要，包括 FLOPs、参数量和模型大小。
-    现在还包括每个主要组件的 FLOPs 分解。
+    [重构] 记录并打印详细的模型参数和 FLOPs 摘要，
+    已适配新的双主干 SAMbaCrack 架构。
     """
-    log.info("--- 模型摘要 ---")
+    log.info("--- SAMbaCrack 模型摘要 ---")
 
-    # --- [新增] 记录 SAMbaCrack 的核心超参数 ---
+    # --- 1. 记录模型核心超参数 ---
     if args.model_name == 'SAMbaCrack':
-        log.info("--- SAMbaCrack 模型超参数 ---")
-        log.info(f"  - SAM (Hiera) Dims: {getattr(model, 'sam_dims', 'N/A')}")
-        log.info(f"  - SAVSS (Mamba) Dims: {getattr(model, 'savss_dims', 'N/A')}")
-        log.info(f"  - Neck (FCM) Dims: {getattr(model, 'fcm_dims', 'N/A')}")
-        log.info(f"  - Hiera Depths: {getattr(model, 'hiera_depths', 'N/A')}")
-        log.info(f"  - SAVSS Depths: {getattr(model, 'savss_depths', 'N/A')}")
-        log.info(f"  - Hiera Num Heads: {getattr(model, 'hiera_num_heads', 'N/A')}")
-        log.info(f"  - SAM Patch Size: {getattr(model, 'sam_patch_size', 'N/A')}")
-        log.info(f"  - SAVSS Patch Size: {getattr(model, 'savss_patch_size', 'N/A')}")
-        log.info("-----------------------------")
+        log.info("--- 核心超参数 ---")
+        # Hiera 分支
+        log.info(f"  - Hiera (SAM) 分支:")
+        log.info(f"    - Dims: {getattr(model, 'sam_dims', 'N/A')}")
+        log.info(f"    - Depths: {getattr(model, 'hiera_depths', 'N/A')}")
+        log.info(f"    - Num Heads: {getattr(model, 'hiera_num_heads', 'N/A')}")
+        # MambaVision 分支
+        log.info(f"  - MambaVision 分支:")
+        log.info(f"    - Variant: {getattr(model, 'mamba_variant', 'N/A')}")
+        log.info(f"    - Dims (Output): {getattr(model, 'mamba_dims', 'N/A')}")
+        log.info(f"    - Depths (Config): {getattr(model, 'savss_depths', 'N/A')}")
+        # Neck & Decoder
+        log.info(f"  - Neck & Decoder:")
+        log.info(f"    - FCM Dims: {getattr(model, 'fcm_dims', 'N/A')}")
+        log.info("--------------------------")
 
-    # --- 1. 计算总 FLOPs (浮点运算次数) ---
+    # --- 2. 计算总体指标 ---
     total_flops = 0
     try:
-        # 创建一个符合模型输入尺寸的虚拟张量
         dummy_input = torch.randn(1, 3, args.load_height, args.load_width).to(next(model.parameters()).device)
-        # 使用 thop.profile 计算 FLOPs 和参数量
         flops, params = profile(model, inputs=(dummy_input,), verbose=False)
         total_flops = flops
-        log.info(f"FLOPs: {total_flops / 1e9:.2f} G")
+        log.info(f"Total FLOPs: {total_flops / 1e9:.2f} G")
     except Exception as e:
         log.warning(f"无法计算总 FLOPs: {e}")
 
-    # --- 2. 计算参数数量 ---
     total_params = sum(p.numel() for p in model.parameters())
     trainable_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
-    log.info(f"总参数量: {total_params / 1e6:.2f} M")
-    log.info(f"可训练参数量: {trainable_params / 1e6:.2f} M")
+    log.info(f"Total Parameters: {total_params / 1e6:.2f} M")
+    log.info(f"Trainable Parameters: {trainable_params / 1e6:.2f} M")
     if total_params > 0:
-        log.info(f"可训练参数比例: {trainable_params / total_params * 100:.2f}%")
-
-    # --- 3. 计算模型大小 (MB) ---
+        log.info(f"Trainable Ratio: {trainable_params / total_params * 100:.2f}%")
+    
     param_size = sum(p.nelement() * p.element_size() for p in model.parameters())
     buffer_size = sum(b.nelement() * b.element_size() for b in model.buffers())
     model_size_mb = (param_size + buffer_size) / 1024**2
-    log.info(f"模型大小: {model_size_mb:.2f} MB")
-    log.info("---------------------\n")
+    log.info(f"Model Size: {model_size_mb:.2f} MB")
+    log.info("----------------------------------\n")
 
-    # --- 4. 针对 SAMbaCrack 模型的详细参数与 FLOPs 分解 ---
+    # --- 3. 各组件详细分解 ---
     if args.model_name == 'SAMbaCrack' and total_flops > 0:
-        log.info("--- SAMbaCrack 详细参数与 FLOPs 分解 ---")
+        log.info("--- 各组件参数与计算量分解 ---")
 
-        # --- 辅助函数，用于安全地计算模块的 FLOPs ---
         def get_module_flops(module, inputs):
+            if module is None: return 0
             try:
+                if not isinstance(inputs, tuple): inputs = (inputs,)
                 flops, _ = profile(module, inputs=inputs, verbose=False)
                 return flops
-            except Exception:
-                return 0 # 如果出错则返回 0
+            except Exception: return 0
 
-        # --- 准备计算所需的虚拟输入和维度信息 ---
+        def get_module_params(module):
+            if module is None: return 0, 0
+            total = sum(p.numel() for p in module.parameters())
+            trainable = sum(p.numel() for p in module.parameters() if p.requires_grad)
+            return total, trainable
+
         device = next(model.parameters()).device
         B, H, W = 1, args.load_height, args.load_width
         
-        # --- [修改] 从模型实例获取维度信息 ---
+        # 从模型实例获取动态维度
         sam_dims = model.sam_dims
+        mamba_dims = model.mamba_dims
         fcm_dims = model.fcm_dims
-        
-        # --- 为每个可直接分析的模块计算 FLOPs ---
-        known_flops = 0
-        flops_map = {}
 
-        # a) SAM Encoder
-        sam_encoder_flops = get_module_flops(model.sam_encoder, (dummy_input,))
-        flops_map['sam_encoder'] = sam_encoder_flops
-        known_flops += sam_encoder_flops
-
-        # b) SAVSS Input (仅 PatchEmbed 有 FLOPs)
-        savss_input_flops = get_module_flops(model.savss_patch_embed, (dummy_input,))
-        flops_map['savss_patch_embed'] = savss_input_flops
-        flops_map['savss_pos_embed'] = 0 # Positional embedding 是参数，没有 FLOPs
-        known_flops += savss_input_flops
-
-        # c) SAM Downscale Adapters
-        sam_adapters_flops = 0
-        # 空间维度基于 Mamba 分支的下采样率 (H/4, H/8, H/16, H/32)
+        # 为 Adapters 和 Neck 创建虚拟输入
+        # 特征图的空间尺寸基于 stride=4 的 patch embedding
         sam_adapter_inputs = [torch.randn(B, sam_dims[i], H//(4*(2**i)), W//(4*(2**i))).to(device) for i in range(4)]
-        if hasattr(model, 'sam_adapters'):
-            for i, adapter in enumerate(model.sam_adapters):
-                sam_adapters_flops += get_module_flops(adapter, (sam_adapter_inputs[i],))
-        flops_map['sam_adapters'] = sam_adapters_flops
-        known_flops += sam_adapters_flops
-
-        # d) Fusion (FCMs)
-        fcms_flops = 0
-        # FCM 的输入是两个被 adapter 统一到 fcm_dims 的特征图
+        mamba_adapter_inputs = [torch.randn(B, mamba_dims[i], H//(4*(2**i)), W//(4*(2**i))).to(device) for i in range(4)]
         fcm_inputs = [(torch.randn(B, fcm_dims[i], H//(4*(2**i)), W//(4*(2**i))).to(device),
                        torch.randn(B, fcm_dims[i], H//(4*(2**i)), W//(4*(2**i))).to(device)) for i in range(4)]
-        if hasattr(model, 'fcms'):
-            for i, fcm in enumerate(model.fcms):
-                fcms_flops += get_module_flops(fcm, fcm_inputs[i])
-        flops_map['fcms'] = fcms_flops # 【修正】使用正确的 key 'fcms'
-        known_flops += fcms_flops
-
-        # e) Decoder (U-Net)
-        decoder_flops = 0
-        # 解码器的输入是融合后、从深到浅的特征图元组
         decoder_inputs = tuple(torch.randn(B, fcm_dims[3-i], H//(4*(2**(3-i))), W//(4*(2**(3-i)))).to(device) for i in range(4))
-        if hasattr(model, 'decoder'):
-            decoder_flops = get_module_flops(model.decoder, (decoder_inputs, (H, W)))
-        flops_map['decoder'] = decoder_flops
-        known_flops += decoder_flops
-        
-        # f) SAVSS Encoder (Mamba) & Mamba Adapters - 通过减法推算
-        # 剩余的 FLOPs 归因于 Mamba 编码器本身以及未明确计算的 Mamba Adapters
-        remaining_flops = total_flops - known_flops
-        flops_map['mamba_encoder'] = remaining_flops
 
-        # --- 遍历模块映射表，打印参数和 FLOPs ---
+        # 定义要分析的模块及其属性名和虚拟输入
         module_map = {
-            "SAM Encoder (骨干网络, 含Adapter)": "sam_encoder",
-            "SAVSS Input (Patch & Pos Embed)": ["savss_patch_embed", "savss_pos_embed"],
-            "SAVSS Encoder (Mamba)": "mamba_encoder",
-            "Fusion (FCM)": "fcms", # 【修正】更新显示名称和模块属性名
-            "Decoder (U-Net)": "decoder",
-            "SAM Downscale Adapters": "sam_adapters"
+            "Hiera Encoder (Frozen)": ("sam_encoder", (dummy_input,)),
+            "MambaVision Encoder": ("mamba_encoder", (dummy_input,)),
+            "Hiera Adapters (Trainable)": ("sam_adapters", sam_adapter_inputs),
+            "Mamba Adapters (Trainable)": ("mamba_adapters", mamba_adapter_inputs),
+            "Fusion Modules (FCM)": ("fcms", fcm_inputs),
+            "UNet Decoder": ("decoder", (decoder_inputs, (H, W))),
         }
 
-        for name, attr_names in module_map.items():
-            if not isinstance(attr_names, list):
-                attr_names = [attr_names]
-            
-            module_total_params = 0
-            module_trainable_params = 0
-            module_flops = 0
-            found_module = False
+        for name, (attr_name, inputs) in module_map.items():
+            if hasattr(model, attr_name):
+                module = getattr(model, attr_name)
+                
+                # 对 ModuleList 特殊处理
+                if isinstance(module, nn.ModuleList):
+                    flops = sum(get_module_flops(sub_mod, inp) for sub_mod, inp in zip(module, inputs))
+                else:
+                    flops = get_module_flops(module, inputs)
 
-            for attr_name in attr_names:
-                if hasattr(model, attr_name):
-                    found_module = True
-                    module = getattr(model, attr_name)
-                    
-                    # 累加参数
-                    if isinstance(module, nn.Parameter):
-                        module_total_params += module.numel()
-                        if module.requires_grad:
-                            module_trainable_params += module.numel()
-                    else:
-                        module_total_params += sum(p.numel() for p in module.parameters())
-                        module_trainable_params += sum(p.numel() for p in module.parameters() if p.requires_grad)
-                    
-                    # 累加 FLOPs
-                    module_flops += flops_map.get(attr_name, 0)
+                total_p, trainable_p = get_module_params(module)
+                trainable_perc = (trainable_p / total_p * 100) if total_p > 0 else 0
 
-            if found_module:
-                trainable_percentage = (module_trainable_params / module_total_params * 100) if module_total_params > 0 else 0
                 log.info(f"  - {name}:")
-                log.info(f"    - FLOPs: {module_flops / 1e9:.3f} G")
-                log.info(f"    - 总参数: {module_total_params / 1e6:.3f}M")
-                log.info(f"    - 可训练参数: {module_trainable_params / 1e6:.3f}M ({trainable_percentage:.2f}%)")
+                log.info(f"    - FLOPs: {flops / 1e9:.3f} G")
+                log.info(f"    - Parameters: {total_p / 1e6:.3f} M")
+                log.info(f"    - Trainable: {trainable_p / 1e6:.3f} M ({trainable_perc:.2f}%)")
 
-        log.info("----------------------------------------------------\n")
-
+        log.info("-----------------------------------------------------\n")
 
 def save_plots(log_df, output_dir):
     """
@@ -295,9 +244,9 @@ def get_args_parser():
                        help="数据集所在的根目录。")
     group.add_argument('--dataset_mode', type=str, default='crack',
                        help="要使用的数据集模式（例如 'crack'）。")
-    group.add_argument('--batch_size_train', type=int, default=10,
+    group.add_argument('--batch_size_train', type=int, default=8,
                        help="训练时的批量大小。")
-    group.add_argument('--batch_size_test', type=int, default=10,
+    group.add_argument('--batch_size_test', type=int, default=8,
                        help="测试/评估时的批量大小。")
     group.add_argument('--load_width', type=int, default=448,
                        help="加载图像时统一调整到的宽度。")
@@ -338,7 +287,7 @@ def get_args_parser():
 
     # --- 6. 路径与输出设置 (Path & Output Settings) ---
     group = parser.add_argument_group('路径与输出设置 (Path & Output Settings)')
-    group.add_argument('--output_dir', default='./results/samba_v19_base on v11',
+    group.add_argument('--output_dir', default='./results/samba_v20',
                        help="所有实验结果（日志、权重、图像）的根目录。")
 
     # --- 7. 环境与杂项设置 (Environment & Miscellaneous Settings) ---
@@ -372,10 +321,12 @@ def main(args):
     weights_dir = output_dir / 'weights'
     masks_dir = output_dir / 'best_epoch_masks'
     plots_dir = output_dir / 'plots'
+    raw_preds_dir = output_dir / 'raw_preds'
     output_dir.mkdir(parents=True, exist_ok=True)
     weights_dir.mkdir(exist_ok=True)
     masks_dir.mkdir(exist_ok=True)
     plots_dir.mkdir(exist_ok=True)
+    raw_preds_dir.mkdir(exist_ok=True)
 
     # 初始化日志记录器
     log = get_logger(output_dir, 'experiment_log')
@@ -488,7 +439,7 @@ def main(args):
             torch.cuda.reset_peak_memory_stats(0)
 
         # --- 7b. 在验证集上进行评估 ---
-        temp_eval_dir = output_dir / f'epoch_{epoch}_raw_preds'
+        temp_eval_dir = raw_preds_dir / f'epoch_{epoch}'
         temp_eval_dir.mkdir(exist_ok=True)
 
         args.phase = 'test'

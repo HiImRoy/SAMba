@@ -12,7 +12,7 @@ if project_root not in sys.path:
 """Model factory."""
 
 import torch
-from models.decoder import bce_dice
+from models.losses import bce_dice
 from mmcls.SAVSS_dev.models.SAVSS.SAMbaCrack import SAMbaCrack
 from models.unet_baseline import UNetBaseline
 
@@ -34,7 +34,7 @@ def build_model(args):
     else:
         raise ValueError(f"Model '{args.model_name}' not recognized.")
 
-    # The loss function is defined in decoder.py, which we can reuse.
+    # The loss function is now defined in losses.py.
     criterion = bce_dice(args)
     criterion.to(device)
 
