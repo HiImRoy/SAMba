@@ -69,7 +69,7 @@ def log_parameter_summary(model, log, args):
             "SAM Encoder (骨干网络, 含Adapter)": "sam_encoder",
             "SAVSS Input (Patch & Pos Embed)": ["savss_patch_embed", "savss_pos_embed"],
             "SAVSS Encoder (Mamba)": "mamba_encoder",
-            "Fusion (HOACM)": "hoacms",
+            "Fusion (FCM)": "fcms",
             "Decoder (U-Net)": "decoder",
             "SAM Downscale Adapters": "sam_adapters"
         }
@@ -194,9 +194,9 @@ def get_args_parser():
 
     # --- 2. 损失函数设置 (Loss Function Settings) ---
     group = parser.add_argument_group('损失函数设置 (Loss Function Settings)')
-    group.add_argument('--BCELoss_ratio', default=0.87, type=float,
+    group.add_argument('--BCELoss_ratio', default=0.83, type=float,
                        help="总损失中二元交叉熵损失（BCE Loss）的权重。")
-    group.add_argument('--DiceLoss_ratio', default=0.13, type=float,
+    group.add_argument('--DiceLoss_ratio', default=0.17, type=float,
                        help="总损失中 Dice 损失的权重。")
 
     # --- 3. 数据集与加载设置 (Dataset & Dataloader Settings) ---
@@ -207,7 +207,7 @@ def get_args_parser():
                        help="要使用的数据集模式（例如 'crack'）。")
     group.add_argument('--batch_size_train', type=int, default=16,
                        help="训练时的批量大小。")
-    group.add_argument('--batch_size_test', type=int, default=16,
+    group.add_argument('--batch_size_test', type=int, default=1,
                        help="测试/评估时的批量大小。")
     group.add_argument('--load_width', type=int, default=448,
                        help="加载图像时统一调整到的宽度。")
@@ -248,7 +248,7 @@ def get_args_parser():
 
     # --- 6. 路径与输出设置 (Path & Output Settings) ---
     group = parser.add_argument_group('路径与输出设置 (Path & Output Settings)')
-    group.add_argument('--output_dir', default='./results/samba_v19_base on v11',
+    group.add_argument('--output_dir', default='./results/samba_v19.1',
                        help="所有实验结果（日志、权重、图像）的根目录。")
 
     # --- 7. 环境与杂项设置 (Environment & Miscellaneous Settings) ---
@@ -426,15 +426,19 @@ def main(args):
         with torch.no_grad():
             model.eval()
             for data in tqdm(test_dl, desc=f"测试 Epoch {epoch}"):
-                x, target = data["image"].to(device), data["label"].cpu().numpy()
-                out = model(x)
-                prob_map_0_1 = torch.sigmoid(out)
-                prob_map_uint8 = (prob_map_0_1[0, 0] * 255).cpu().numpy().astype(np.uint8)
-                
-                # 保存原始预测图和标签图以供 `eval` 函数使用
-                root_name = data["A_paths"][0].split("/")[-1][:-4]
-                cv2.imwrite(str(temp_eval_dir / f"{root_name}_pre.png"), prob_map_uint8)
-                cv2.imwrite(str(temp_eval_dir / f"{root_name}_lab.png"), (target[0, 0] * 255).astype(np.uint8))
+                images, targets = data["image"].to(device), data["label"].cpu().numpy()
+                outputs = model(images)
+                prob_maps = torch.sigmoid(outputs)
+
+                # 遍历批次中的每一张图片并保存
+                for i in range(images.size(0)):
+                    prob_map_uint8 = (prob_maps[i, 0] * 255).cpu().numpy().astype(np.uint8)
+                    target_uint8 = (targets[i, 0] * 255).astype(np.uint8)
+                    
+                    # 保存原始预测图和标签图以供 `eval` 函数使用
+                    root_name = data["A_paths"][i].split("/")[-1][:-4]
+                    cv2.imwrite(str(temp_eval_dir / f"{root_name}_pre.png"), prob_map_uint8)
+                    cv2.imwrite(str(temp_eval_dir / f"{root_name}_lab.png"), target_uint8)
 
         # 调用评估脚本计算各项指标
         current_epoch_metrics = eval(log, str(temp_eval_dir), epoch)

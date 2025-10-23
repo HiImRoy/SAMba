@@ -25,11 +25,11 @@ args = parser.parse_args()
 # 2. 明确设置运行阶段和数据集路径
 args.phase = 'test'
 #    确保这里的路径是相对于您项目根目录的正确路径
-args.dataset_path = './data/new_TUT'
+args.dataset_path = './data/CRACK500'
 
 # 3. 明确设置加载的图像尺寸以匹配您的数据
-args.load_width = 512
-args.load_height = 512
+args.load_width = 448
+args.load_height = 448
 
 # --- END: 可修改区域 ---
 
@@ -42,24 +42,39 @@ if __name__ == '__main__':
     test_dl = create_dataset(args)
     print(f"数据集创建成功，共找到 {len(test_dl)} 张测试图片。")
 
-    # --- START: 可修改区域 (根据您的设置) ---
-    # 5. 修改权重加载路径
-    #    确保这是您存放权重的确切路径
-    load_model_file = "./checkpoint_TUT/checkpoint_TUT.pth"
-    # --- END: 可修改区域 ---
-
     model, _ = build_model(args) # criterion在测试时不需要，可以用_忽略
 
+    # --- START: 修改权重加载逻辑 ---
+    # 使用 --resume 参数来指定权重文件路径
+    # 如果没有通过命令行指定 --resume，则使用一个默认路径
+    if not args.resume:
+        # 默认的权重文件路径，用户可以根据需要修改
+        default_checkpoint_path = "results/samba_v19.0/20251020-190044_SAMbaCrack_DeepCrack miou 0.92/weights/checkpoint_best.pth"
+        print(f"未通过 --resume 参数指定权重文件，将尝试加载默认路径: {default_checkpoint_path}")
+        args.resume = default_checkpoint_path
+
     # 检查权重文件是否存在
-    if not os.path.exists(load_model_file):
-        print(f"错误：权重文件未找到！请检查路径: {load_model_file}")
+    if not os.path.exists(args.resume):
+        print(f"错误：权重文件未找到！请检查路径: {args.resume}")
         exit()
 
-    print(f"正在从 {load_model_file} 加载权重...")
-    state_dict = torch.load(load_model_file, map_location=device) # 添加 map_location 以确保设备兼容性
-    model.load_state_dict(state_dict["model"])
+    print(f"正在从 {args.resume} 加载权重...")
+    # 添加 map_location 以确保设备兼容性
+    state_dict = torch.load(args.resume, map_location=device)
+    
+    # 检查 state_dict 中是否包含 'model' 键，这通常是训练 checkpoint 的格式
+    if "model" in state_dict:
+        model.load_state_dict(state_dict["model"])
+    else:
+        # 如果没有 'model' 键，则尝试直接加载整个 state_dict
+        # 这可能是直接保存的模型 state_dict，而不是完整的 checkpoint
+        print("警告: 权重文件中未找到 'model' 键，尝试直接加载 state_dict。")
+        model.load_state_dict(state_dict)
+
     model.to(device)
     print("加载模型成功!")
+    # --- END: 修改权重加载逻辑 ---
+
 
     # ==================== START: 新增代码块 ==================== #
     #                                                             #

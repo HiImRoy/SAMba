@@ -148,17 +148,18 @@ class SAMbaCrack(nn.Module):
         # Hiera-H [256-512-1024-2048] [2-6-36-4] [4-8-16-32] 125G 673M
 
         # # 正儿八经但是效果不好的超参数
-        # self.sam_dims = [112, 224, 448, 896]
-        # self.savss_dims = [64, 128, 256, 512]
-        # self.hiera_depths = getattr(args, 'hiera_depths', (2, 3, 16, 3))
-        # self.savss_depths = getattr(args, 'savss_depths', (2, 2, 2, 2))
-        # self.hiera_num_heads = getattr(args, 'hiera_num_heads', (2, 4, 8, 16))
-        # 莫名其妙但是就是效果好的超参数
-        self.savss_depths = getattr(args, 'savss_depths', (1, 1, 1, 1))
+        self.sam_dims = [112, 224, 448, 896]
         self.savss_dims = [64, 128, 256, 512]
-        self.sam_dims = [96, 192, 384, 768]
-        self.hiera_depths = getattr(args, 'hiera_depths', (2, 2, 6, 2))
-        self.hiera_num_heads = getattr(args, 'hiera_num_heads', (3, 6, 12, 24))
+        self.hiera_depths = getattr(args, 'hiera_depths', (2, 3, 16, 3))
+        self.savss_depths = getattr(args, 'savss_depths', (2, 2, 2, 2))
+        self.hiera_num_heads = getattr(args, 'hiera_num_heads', (2, 4, 8, 16))
+
+        # 莫名其妙但是就是效果好的超参数
+        # self.savss_dims = [64, 128, 256, 512]
+        # self.sam_dims = [96, 192, 384, 768]
+        # self.savss_depths = getattr(args, 'savss_depths', (1, 1, 1, 1))
+        # self.hiera_depths = getattr(args, 'hiera_depths', (2, 2, 6, 2))
+        # self.hiera_num_heads = getattr(args, 'hiera_num_heads', (3, 6, 12, 24))
 
         savss_drop_path_rate = getattr(args, 'savss_drop_path_rate', 0.1)
         savss_use_rms_norm = getattr(args, 'savss_use_rms_norm', True)
